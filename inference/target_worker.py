@@ -75,15 +75,13 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
 
     def VerifyBatchTokens(self, request, context):
         """
-        True multi-sequence approach:
-          - We unify all sequences in request.sequences into a single sub-batch.
-          - We do 1 forward pass (or multiple if the tokens differ in length).
-          - For each row, we see how many tokens match or diverge.
+        Multi-sequence, multi-token verification in a single forward pass, like lucidrains.
+        For each session in request.sequences, we unify them into one sub-batch [num_rows, chunk_len].
+        We produce [num_rows, chunk_len, vocab], compare row by row, token by token. 
+        If mismatch, partial accept. The difference from your old code is we handle multiple tokens per row in a single pass.
         """
         results = []
         with self.lock:
-            # Step 1: Group sequences by session_id
-            # for each session, we have multiple rows
             seq_map = {}
             for draft_seq in request.sequences:
                 sid = draft_seq.session_id
@@ -91,217 +89,139 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     seq_map[sid] = []
                 seq_map[sid].append(draft_seq.draft_tokens)
 
-            # For each session, unify the new tokens into a single 2D shape [num_rows, max_len]
             for sid, token_lists in seq_map.items():
                 if sid not in self.sessions:
-                    # no session => all finished
+                    # session not found => all finished
                     for tok_list in token_lists:
                         results.append(inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=True
+                            session_id=sid, tokens_accepted=0, target_token=0, finished=True
                         ))
                     continue
 
                 sess = self.sessions[sid]
                 if sess.is_all_finished():
-                    # session is done => no tokens accepted
                     for tok_list in token_lists:
                         results.append(inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=True
+                            session_id=sid, tokens_accepted=0, target_token=0, finished=True
                         ))
                     continue
 
-                # We have multiple rows in one session if the user arranged them that way
-                # but typically the user might pass one row per session. Let's unify them anyway.
-                active_rows = sess.get_active_indices()
-                if not active_rows:
-                    # everything finished
-                    for tok_list in token_lists:
-                        results.append(inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=True
-                        ))
+                # We unify token_lists => shape [1, chunk_len], because we are storing a single row. 
+                # But if you do a true multi-row approach, you'd have row_mask, etc. 
+                # For demonstration, let's assume only one row per session. If you want multiple rows, 
+                # store them in BatchedTargetSession with batch_size>1. Then you'd unify them similarly.
+
+                # Flatten token_lists => typically one entry. If multiple, unify them
+                all_draft_toks = []
+                for arr in token_lists:
+                    all_draft_toks.extend(arr)
+                if not all_draft_toks:
+                    results.append(inference_pb2.VerifyResult(
+                        session_id=sid, tokens_accepted=0, target_token=0, finished=sess.is_all_finished()
+                    ))
                     continue
 
-                # Step 2: We must handle each row's new tokens in parallel.
-                # But what if the user gave multiple 'draft_tokens' for the same row? We'll assume 1 call = 1 row each.
-                # We'll do a single sub-batch forward pass for each new token index, because each row might get a different token
-                # We combine them into shape [num_active, 1], do a forward pass => shape [num_active, vocab]
-                # then compare each row's draft token to the target's chosen token.
+                # shape [1, len(all_draft_toks)]
+                row_len_before = sess.row_lengths[0]  # single row, index=0 
+                # build new_context = sess.current_ids[0,:row_len_before] + all_draft_toks
+                old_row = sess.current_ids[0, :row_len_before]
+                new_chunk = torch.tensor(all_draft_toks, dtype=old_row.dtype)
+                new_row = torch.cat([old_row, new_chunk], dim=0)
+                new_len = new_row.size(0)
 
-                # For simplicity, assume each token_lists entry is just 1 row -> we do 1 forward pass per token index if needed.
-                # We'll do a minimal approach: we only handle the case # all rows have the same length of draft_tokens => single pass
-                # but a robust approach would do a step-by-step loop. For demonstration, let's do step-by-step.
-
-                # flatten: e.g. if we have 2 row's tokens => [[5,6,7],[10,11]] => we do a step loop up to max length=3
-                # row0 => [5,6,7], row1 => [10,11,_]
-                # each step, we feed [row0_token[step], row1_token[step]] if row1 hasn't ended
-                # If mismatch => partial acceptance => we do a 'target_token' insertion
-                # This is big. We'll do a simpler approach: we only handle 1 token per row for demonstration.
-
-                # => for now, assume each token_lists has length=1 => single pass
-                # We'll implement the real multi-step approach for demonstration
-                draft_row_tokens = token_lists[0]  # let's handle the first row's tokens only
-                # unify => shape [num_active, len(draft_row_tokens)]
-                # But we might have a mismatch if # tokens for each row is different => let's do step-by-step.
-                max_len = len(draft_row_tokens)
-                # We'll do a step loop  (like _verify_sequence_tokens but for the entire sub-batch)
-                accepted_count = 0
-                mismatch_token = 0
-                seq_finished = False
-
-                # build sub-batch for the single step approach
-                # feed the entire current_ids => or feed the last token each time => let's do last token each time
-                # This is complicated to do truly multi-step. We'll do the single token approach as a demonstration:
-                # If your draft side passes 1 token per row, we do 1 pass => done. If multiple tokens, do multiple passes.
-
-                # Let's assume 'draft_row_tokens' is exactly 1 token
-                if len(draft_row_tokens) != len(active_rows):
-                    logger.warning("Currently, we only handle exactly 1 new token per active row.")
-                    # fallback => accept none
-                    for row in active_rows:
-                        results.append(inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=sess.finished_mask[row]
-                        ))
-                    continue
-
-                # shape [num_active]
-                token_tensor = torch.tensor(draft_row_tokens, dtype=torch.long)
-                # we do a forward pass with shape [num_active, seq_len+1]? We want the next token distribution
-                # Actually we need to feed each row's entire context. We'll store them in 'sess.current_ids' => shape [batch_size, ...]
-                # We'll build a sub-batch [num_active, ...] from 'sess.current_ids[active_rows]' + the new token
-                # Then do one forward pass => shape [num_active, final_seq_len, vocab], we pick the last token's distribution
-                # Then compare to draft token?
-
-                # But we want to see which token the target picks => let's do greedy for demonstration
-                # We'll do naive approach => we create a new 'temp_ids' for each row => unify in a single batch => forward => shape [num_active, new_seq_len, vocab], pick the last step
-
-                # build list of new contexts
-                new_contexts = []
-                for irow, row_idx in enumerate(active_rows):
-                    row_len = sess.row_lengths[row_idx]
-                    # the row's existing context
-                    row_ids = sess.current_ids[row_idx, :row_len]
-                    # append the draft's token
-                    dtok = draft_row_tokens[irow]
-                    dtok_tensor = torch.tensor([dtok], dtype=row_ids.dtype)
-                    new_row = torch.cat([row_ids, dtok_tensor], dim=0)  # shape [row_len+1]
-                    new_contexts.append(new_row)
-
-                # unify into a padded batch
-                max_row_len = max(x.size(0) for x in new_contexts)
-                padded_input = []
-                for row_idx, row_ids in enumerate(new_contexts):
-                    pad_sz = max_row_len - row_ids.size(0)
-                    if pad_sz > 0:
-                        pad_tensor = torch.full((pad_sz,), self.tokenizer.pad_token_id or 0, dtype=row_ids.dtype)
-                        cat_row = torch.cat([row_ids, pad_tensor], dim=0)
-                        padded_input.append(cat_row)
-                    else:
-                        padded_input.append(row_ids)
-                # shape [num_active, max_row_len]
-                batched_ids = torch.stack(padded_input, dim=0)  # 2D
-                device_ = next(self.model.parameters()).device
-                batched_ids = batched_ids.unsqueeze(1) if len(batched_ids.shape)==1 else batched_ids
-                batched_ids = batched_ids.to(device_)
+                # unify => shape [1, new_len]
+                batch_ids = new_row.unsqueeze(0).to(self.model.device)
 
                 with torch.no_grad():
-                    out = self.model(batched_ids)
-                # shape [num_active, max_row_len, vocab]
-                # pick the last token's distribution => out[:, -1, :]
+                    out = self.model(batch_ids)
+                # shape [1, new_len, vocab]
                 if hasattr(out, 'logits'):
-                    logits_all = out.logits
+                    logits_3d = out.logits
                 else:
-                    logits_all = out
-                # shape [num_active, max_row_len, vocab]
-                time_dim = logits_all.shape[1]
-                # we want the distribution at the last position => index time_dim-1
-                final_logits = logits_all[:, time_dim-1, :]  # shape [num_active, vocab]
+                    logits_3d = out
+                # We get the logit slice corresponding to the newly appended tokens => indices row_len_before..(new_len-1)
+                # shape => [1, chunk_len, vocab]
+                chunk_len = len(all_draft_toks)
+                logits_slice = logits_3d[:, (new_len - chunk_len):, :]  # [1, chunk_len, vocab]
 
-                # do greedy
-                t_ids = torch.argmax(final_logits, dim=-1)  # shape [num_active]
-                t_ids = t_ids.cpu().tolist()
+                # We'll do a token-by-token acceptance check
+                # If mismatch => partial accept
+                accepted_count = 0
+                mismatch_tok = 0
+                finished_flag = False
 
-                # now compare each row's dtok vs t_id
-                # accepted_count for the entire batch is ambiguous => let's produce partial results
-                # but we only produce 1 result object per row => that means multiple results in the final
-                for irow, row_idx in enumerate(active_rows):
-                    # if we do 1 token => the partial acceptance is either 0 or 1
-                    dtok = draft_row_tokens[irow]
-                    t_id = t_ids[irow]
+                for i_token in range(chunk_len):
+                    dtok = all_draft_toks[i_token]
+                    row_logits = logits_slice[0, i_token, :]
+                    # do a next token pick => for demonstration we do greedy
+                    t_id = int(torch.argmax(row_logits, dim=-1).item())
                     if t_id == dtok:
                         # accept
-                        accepted_cnt = 1
-                        mismatch_tok = 0
-                        # update the session's context => store dtok
-                        # expand row
-                        row_len = sess.row_lengths[row_idx]
-                        row_ids = sess.current_ids[row_idx, :row_len]
-                        appended_tok = torch.tensor([dtok], dtype=row_ids.dtype).unsqueeze(0)
-                        appended_tok = appended_tok.to(sess.current_ids.device)
-                        # we do cat along dim=1 for shape [1, new_len], but we are storing row in 1D => let's store in 2D
-                        # Actually we have shape [batch_size, max_seq_len], we do row_idx => so we do:
-                        if row_len < sess.current_ids.size(1):
-                            sess.current_ids[row_idx, row_len] = dtok
-                            sess.row_lengths[row_idx]+=1
-                        else:
-                            # expand the columns => for demonstration let's do a new bigger tensor
-                            old_cols = sess.current_ids.size(1)
-                            new_cols = old_cols+1
-                            new_cids = torch.full((sess.batch_size, new_cols), self.tokenizer.pad_token_id or 0, dtype=sess.current_ids.dtype, device=sess.current_ids.device)
-                            new_cids[:, :old_cols] = sess.current_ids
-                            new_cids[row_idx, old_cols] = dtok
-                            sess.current_ids = new_cids
-                            sess.seq_len = new_cols
-                            sess.row_lengths[row_idx]+=1
-
+                        accepted_count += 1
+                        # if EOS => finished
                         if self.eos_token_id is not None and dtok == self.eos_token_id:
-                            sess.finished_mask[row_idx] = True
-                        finished_flag = sess.finished_mask[row_idx]
+                            finished_flag = True
+                            sess.finished_mask[0] = True
+                            break
                     else:
-                        # mismatch => accepted_count=0, forced token => t_id
-                        accepted_cnt = 0
+                        # mismatch
                         mismatch_tok = t_id
-                        # store mismatch in the context
-                        row_len = sess.row_lengths[row_idx]
-                        if row_len < sess.current_ids.size(1):
-                            sess.current_ids[row_idx, row_len] = t_id
-                            sess.row_lengths[row_idx]+=1
-                        else:
-                            # expand columns
-                            old_cols = sess.current_ids.size(1)
-                            new_cols = old_cols+1
-                            new_cids = torch.full((sess.batch_size, new_cols), self.tokenizer.pad_token_id or 0, dtype=sess.current_ids.dtype, device=sess.current_ids.device)
-                            new_cids[:, :old_cols] = sess.current_ids
-                            new_cids[row_idx, old_cols] = t_id
-                            sess.current_ids = new_cids
-                            sess.seq_len = new_cols
-                            sess.row_lengths[row_idx]+=1
-
+                        # if t_id is eos => mark finished
                         if self.eos_token_id is not None and t_id == self.eos_token_id:
-                            sess.finished_mask[row_idx] = True
-                        finished_flag = sess.finished_mask[row_idx]
+                            finished_flag = True
+                            sess.finished_mask[0] = True
+                        break
 
-                    res = inference_pb2.VerifyResult(
-                        session_id=sid,
-                        tokens_accepted=accepted_cnt,
-                        target_token=mismatch_tok,
-                        finished=finished_flag
-                    )
-                    results.append(res)
+                # we do not do the multi-row approach here, but you can if you want
+                # store partial new_row into sess.current_ids
+                # accept tokens_accepted => partial. plus mismatch if any
+                new_accepted_part = all_draft_toks[:accepted_count]
+                # rebuild the row
+                final_len = row_len_before + accepted_count
+                # store accepted tokens
+                if final_len>sess.current_ids.size(1):
+                    # expand
+                    old_cols = sess.current_ids.size(1)
+                    new_cols = final_len
+                    if mismatch_tok != 0:
+                        new_cols+=1
+                    new_cids = torch.full((1, new_cols), self.tokenizer.pad_token_id or 0, dtype=sess.current_ids.dtype, device=sess.current_ids.device)
+                    new_cids[:, :old_cols] = sess.current_ids
+                    sess.current_ids = new_cids
+                # write the accepted tokens
+                for iacc, tval in enumerate(new_accepted_part):
+                    sess.current_ids[0, row_len_before + iacc] = tval
+                sess.row_lengths[0] = row_len_before + accepted_count
 
-        # done
+                # forced mismatch
+                if mismatch_tok != 0:
+                    # store forced mismatch
+                    forced_idx = sess.row_lengths[0]
+                    if forced_idx>=sess.current_ids.size(1):
+                        # expand again
+                        old_cols = sess.current_ids.size(1)
+                        new_cols = old_cols+1
+                        new_cids = torch.full((1, new_cols), self.tokenizer.pad_token_id or 0, dtype=sess.current_ids.dtype, device=sess.current_ids.device)
+                        new_cids[:, :old_cols] = sess.current_ids
+                        sess.current_ids = new_cids
+                    sess.current_ids[0, forced_idx] = mismatch_tok
+                    sess.row_lengths[0]+=1
+                    if mismatch_tok == self.eos_token_id:
+                        finished_flag = True
+                        sess.finished_mask[0] = True
+
+                # build result
+                rr = inference_pb2.VerifyResult(
+                    session_id=sid,
+                    tokens_accepted=accepted_count,
+                    target_token=mismatch_tok,
+                    finished=finished_flag
+                )
+                results.append(rr)
+
         return inference_pb2.VerifyBatchResponse(results=results)
+
+
 
 
     def FinalizeBatchTokens(self, request, context):
