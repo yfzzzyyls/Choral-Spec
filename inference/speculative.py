@@ -261,44 +261,57 @@ def speculative_decode_batch(
         return all(finished_mask)
 
     while not all_done():
+        logger.debug("Entering decode loop iteration. Active indices:")
         active_indices = [i for i, fin in enumerate(finished_mask) if not fin]
+        logger.debug(f"  active_indices={active_indices}")
         if not active_indices:
+            logger.debug("No active sequences left. Breaking.")
             break
 
+        # how many tokens left for each row
         tokens_left = [max_new_tokens - new_tokens_count[i] for i in range(batch_size)]
-        # Each row can produce up to 'gamma' tokens
-        row_chunk_size = [
-            0 if finished_mask[i] else min(tokens_left[i], gamma)
-            for i in range(batch_size)
-        ]
+        # row_chunk_size[i] = min(tokens_left[i], gamma) if row i not finished
+        row_chunk_size = []
+        for i in range(batch_size):
+            if finished_mask[i]:
+                row_chunk_size.append(0)
+            else:
+                row_chunk_size.append(min(tokens_left[i], gamma))
+
         max_chunk = max(row_chunk_size)
+        logger.debug(f"row_chunk_size={row_chunk_size}, max_chunk={max_chunk}")
+
+        # If nobody can produce more tokens, break out
         if max_chunk == 0:
+            logger.debug("max_chunk=0 => No more tokens to generate. Stopping decode.")
             break
 
-        # We'll do a step loop for each token in [0..max_chunk-1]
+        # We'll do step_i from 0..(max_chunk-1)
         for step_i in range(max_chunk):
-            # Build a [batch_size, 1] input for the draft model
+            # Build sub-batch of shape [batch_size, 1]
             gather_input = []
             for i in range(batch_size):
                 if row_chunk_size[i] > step_i:
-                    # feed the last token of output_tokens[i]
+                    # propose one new token for row i
                     last_token_id = output_tokens[i][-1] if new_tokens_count[i] > 0 else output_tokens[i][-1]
                     gather_input.append(last_token_id)
                 else:
                     # pad
                     gather_input.append(tokenizer.pad_token_id or 0)
 
+            logger.debug(f"  step {step_i}: gather_input={gather_input}")
             input_tensor = torch.tensor(gather_input, dtype=torch.long, device=device).unsqueeze(1)
             draft_out = draft_model(input_ids=input_tensor)
-            # handle shape
             if isinstance(draft_out, (tuple, list)):
                 logits_3d = draft_out[0]
             else:
                 logits_3d = draft_out
-            if logits_3d.dim() == 2:
-                logits_3d = logits_3d.unsqueeze(1)  # [batch_size, 1, vocab]
 
-            # top-p sample each row that is still generating
+            if logits_3d.dim() == 2:
+                # shape [batch_size, vocab]
+                logits_3d = logits_3d.unsqueeze(1)  # => [batch_size, 1, vocab]
+
+            # top-p sample each row that is still generating at step_i
             for b_i in range(batch_size):
                 if row_chunk_size[b_i] > step_i:
                     row_logits = logits_3d[b_i, -1, :] / temperature
@@ -322,8 +335,7 @@ def speculative_decode_batch(
                     output_tokens[b_i].append(new_token)
                     new_tokens_count[b_i]+=1
 
-        # Now we have a block of up to row_chunk_size[i] tokens for each row
-        # gather them
+        # Now we have row_chunk_size[i] newly proposed tokens for each row => block_props
         block_props = {}
         for i in range(batch_size):
             cl = row_chunk_size[i]
@@ -332,16 +344,20 @@ def speculative_decode_batch(
             else:
                 block_toks = []
             block_props[i] = block_toks
+        logger.debug(f"Block proposals => {block_props}")
 
+        # call verify
         verify_list = []
         for i in range(batch_size):
             if not finished_mask[i] and block_props[i]:
                 verify_list.append((session_ids[i], block_props[i]))
-
         if not verify_list:
+            logger.debug("No draft tokens to verify for this chunk. Continuing decode loop.")
             continue
 
+        logger.debug(f"Calling verify_batch_tokens with {verify_list}")
         verify_results = grpc_client.verify_batch_tokens(stub, verify_list)
+        logger.debug(f"verify_results={verify_results}")
         result_map = {}
         for r in verify_results:
             sid = r['session_id']
@@ -383,19 +399,19 @@ def speculative_decode_batch(
             if row_finished or (tokenizer.eos_token_id is not None and len(output_tokens[i])>0 and output_tokens[i][-1]==tokenizer.eos_token_id):
                 finished_mask[i] = True
 
-            # finalize
             fin_list = chunk_toks[:accepted_count]
             if forced_tok is not None:
                 fin_list.append(forced_tok)
             if fin_list:
                 finalize_data[i] = fin_list
 
-        # call finalize
+        # finalize
         final_seq_msgs = []
         for i, tokens_to_fin in finalize_data.items():
             final_seq_msgs.append((session_ids[i], tokens_to_fin))
         if final_seq_msgs:
             fresps = grpc_client.finalize_batch_tokens(stub, final_seq_msgs)
+            logger.debug(f"finalize_batch_tokens => {fresps}")
             for fr in fresps:
                 sid = fr['session_id']
                 fin = fr['finished']
@@ -403,6 +419,7 @@ def speculative_decode_batch(
                 if fin:
                     finished_mask[i2] = True
 
+        # check max
         for i in range(batch_size):
             if not finished_mask[i] and new_tokens_count[i]>=max_new_tokens:
                 finished_mask[i] = True
