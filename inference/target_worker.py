@@ -113,7 +113,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         Each row => one sequence. If multiple, we handle them in parallel. We do partial acceptance.
         Includes fix for 'too many indices for tensor of dimension 2' by reshaping 2D -> 3D.
         """
-        logger.debug(f"VerifyBatchTokens called with {len(request.sequences)} sequences")
+        logger.info(f"VerifyBatchTokens called with {len(request.sequences)} sequences")
         results = []
         with self.lock:
             seq_map = {}
