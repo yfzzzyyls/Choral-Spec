@@ -16,7 +16,7 @@ message StartResponse {
   bool acknowledged = 1;
 }
 
-// For BATCH verification.
+// For BATCH verification (legacy single-row).
 message DraftSequence {
   uint64 session_id = 1;        // which session these tokens belong to
   repeated int32 draft_tokens = 2;  // the newly generated tokens from the draft model
@@ -37,7 +37,7 @@ message VerifyBatchResponse {
   repeated VerifyResult results = 1;
 }
 
-// For finalizing tokens on target side after acceptance.
+// For finalizing tokens on target side after acceptance (legacy single-row).
 message FinalizeSequence {
   uint64 session_id = 1;        // same session
   repeated int32 tokens = 2;    // tokens accepted or forced by target
@@ -57,8 +57,7 @@ message FinalizeBatchResponse {
 }
 
 // The older single-sequence definitions are left for backward compatibility.
-// However, we can keep them or remove them if you prefer. For a safe drop-in,
-// we keep them, but the server and client can choose which to call.
+// The server and client can choose which to call.
 
 message VerifyRequest {
   uint64 session_id = 1;
@@ -88,17 +87,57 @@ message GenerateResponse {
   string output_text = 1;
 }
 
+// =============================
+// NEW 2D BATCHE MESSAGES
+// =============================
+
+// DraftSequence2D holds a row-major flattened 2D array, shape = [batch_size, tokens_per_seq]
+message DraftSequence2D {
+  uint64 session_id = 1;        // which session
+  repeated int32 shape = 2;     // exactly 2 elements: [sub_batch_size, tokens_per_seq]
+  repeated int32 draft_tokens_2d = 3; // row-major flattened tokens
+}
+
+// For verification of multiple rows in a single call
+message VerifyBatch2DRequest {
+  repeated DraftSequence2D sequences_2d = 1;
+}
+
+message VerifyBatch2DResponse {
+  repeated VerifyResult results = 1;
+}
+
+// For finalizing multiple rows in a single call
+message FinalizeSequence2D {
+  uint64 session_id = 1;
+  repeated int32 shape = 2;  // [sub_batch_size, tokens_to_finalize]
+  repeated int32 tokens_2d = 3;
+}
+
+message FinalizeBatch2DRequest {
+  repeated FinalizeSequence2D sequences_2d = 1;
+}
+
+message FinalizeBatch2DResponse {
+  repeated FinalizeBatchResult results = 1;
+}
+
+
 // Speculative Decoding gRPC Service definition
 service SpeculativeService {
   rpc StartGeneration(StartRequest) returns (StartResponse);
 
-  // BATCH calls
+  // BATCH calls (legacy single-row)
   rpc VerifyBatchTokens(VerifyBatchRequest) returns (VerifyBatchResponse);
   rpc FinalizeBatchTokens(FinalizeBatchRequest) returns (FinalizeBatchResponse);
 
-  // Single-sequence calls
+  // Single-sequence calls (legacy)
   rpc VerifyDraftTokens(VerifyRequest) returns (VerifyResponse);
   rpc FinalizeTokens(FinalizeRequest) returns (FinalizeResponse);
+
+  // 2D BATCH calls (new)
+  rpc VerifyBatchTokens2D(VerifyBatch2DRequest) returns (VerifyBatch2DResponse);
+  rpc FinalizeBatchTokens2D(FinalizeBatch2DRequest) returns (FinalizeBatch2DResponse);
 
   // Optional full generation for baseline
   rpc GenerateFull(StartRequest) returns (GenerateResponse);
