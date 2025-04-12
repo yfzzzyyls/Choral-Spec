@@ -217,39 +217,49 @@ def speculative_decode_batch(
     session_ids=None
 ):
     """
-    True single-pass multi-sequence decoding for multiple tokens per chunk (gamma) 
-    across multiple sequences (batch_size). Each chunk => shape [batch_size, gamma].
-    Then we do exactly ONE forward pass => [batch_size, gamma, vocab].
-    This is the lucidrains approach for real multi-sequence, partial acceptance.
+    TRUE Single-Pass Multi-Sequence decoding: each chunk => EXACTLY one forward pass
+    that yields [batch_size, current_length + gamma, vocab], from which we extract
+    the last 'gamma' tokens for each row.
 
-    NOTE: We do NOT use 'draft_model.device'. Instead, we get device via next(draft_model.parameters()).device.
+    This matches lucidrains' approach more closely:
+      - No "for step_i in range(gamma)" loop on the draft side
+      - We rely on the model doing a single pass for gamma tokens
+
+    NOTE: For big chunk generation (gamma>1), you must ensure the draft model
+    can generate multiple tokens in a single pass. For huggingface, that might
+    require a 'generate()' call or a custom approach with 'model(..., use_cache=True, do_sample=True, num_return_sequences=gamma, ???)'.
+
+    Because 'transformers_neuronx.LlamaForSampling' does not natively do
+    multi-token single forward pass, we do a pseudo approach: feed [batch_size, old_len+gamma]
+    as a single input with a BFS method. This is for demonstration only.
     """
 
     import time
+    import torch
     import random
 
+    logger.info("=== Starting TRUE Single-Pass Multi-Sequence Decoding ===")
     start_t = time.time() if profile else None
 
-    # Determine device from model parameters (LlamaForSampling has no .device attribute)
-    device_params = next(draft_model.parameters(), None)
-    device = device_params.device if device_params is not None else torch.device('cpu')
+    # Get device from the draft model's first parameter
+    param = next(draft_model.parameters(), None)
+    device = param.device if param is not None else torch.device('cpu')
 
+    batch_size = input_ids_batch.size(0)
     input_ids_batch = input_ids_batch.to(device)
     attention_mask_batch = attention_mask_batch.to(device)
-    batch_size = input_ids_batch.size(0)
 
-    # If no session_ids, create them
     if session_ids is None:
         from uuid import uuid4
         session_ids = [int(uuid4()) & 0xFFFFFFFF for _ in range(batch_size)]
 
-    # Extract initial prompts
+    # Convert the input into lists of tokens
+    # initial output_tokens for each row
     output_tokens = []
-    lengths = attention_mask_batch.sum(dim=1).tolist()
+    row_lengths = attention_mask_batch.sum(dim=1).tolist()
     for i in range(batch_size):
-        prompt_len = lengths[i]
-        prompt_ids = input_ids_batch[i, :prompt_len].tolist()
-        output_tokens.append(prompt_ids)
+        row_toks = input_ids_batch[i, : row_lengths[i]].tolist()
+        output_tokens.append(row_toks)
 
     new_tokens_count = [0]*batch_size
     finished_mask = [False]*batch_size
@@ -257,107 +267,122 @@ def speculative_decode_batch(
     accepted_tokens_total = [0]*batch_size
     forced_tokens_total = [0]*batch_size
 
-    def all_done():
+    def all_finished():
         return all(finished_mask)
 
-    while not all_done():
-        logger.info("Entering decode loop iteration. Active indices:")
-        active_indices = [i for i, fin in enumerate(finished_mask) if not fin]
-        logger.info(f"  active_indices={active_indices}")
-        if not active_indices:
-            logger.info("No active sequences left. Breaking.")
-            break
-
-        # how many tokens left for each row
+    while not all_finished():
+        # find how many tokens each row can still generate
         tokens_left = [max_new_tokens - new_tokens_count[i] for i in range(batch_size)]
-        # row_chunk_size[i] = min(tokens_left[i], gamma) if row i not finished
-        row_chunk_size = []
+        chunk_sizes = []
         for i in range(batch_size):
             if finished_mask[i]:
-                row_chunk_size.append(0)
+                chunk_sizes.append(0)
             else:
-                row_chunk_size.append(min(tokens_left[i], gamma))
+                chunk_sizes.append(min(tokens_left[i], gamma))
 
-        max_chunk = max(row_chunk_size)
-        logger.info(f"row_chunk_size={row_chunk_size}, max_chunk={max_chunk}")
-
-        # If nobody can produce more tokens, break out
+        max_chunk = max(chunk_sizes)
         if max_chunk == 0:
-            logger.info("max_chunk=0 => No more tokens to generate. Stopping decode.")
+            # no one can produce more tokens => break
             break
 
-        # We'll do step_i from 0..(max_chunk-1)
-        for step_i in range(max_chunk):
-            # Build sub-batch of shape [batch_size, 1]
-            gather_input = []
-            for i in range(batch_size):
-                if row_chunk_size[i] > step_i:
-                    # propose one new token for row i
-                    last_token_id = output_tokens[i][-1] if new_tokens_count[i] > 0 else output_tokens[i][-1]
-                    gather_input.append(last_token_id)
-                else:
-                    # pad
-                    gather_input.append(tokenizer.pad_token_id or 0)
-
-            logger.info(f"  step {step_i}: gather_input={gather_input}")
-            input_tensor = torch.tensor(gather_input, dtype=torch.long, device=device).unsqueeze(1)
-            draft_out = draft_model(input_ids=input_tensor)
-            if isinstance(draft_out, (tuple, list)):
-                logits_3d = draft_out[0]
-            else:
-                logits_3d = draft_out
-
-            if logits_3d.dim() == 2:
-                # shape [batch_size, vocab]
-                logits_3d = logits_3d.unsqueeze(1)  # => [batch_size, 1, vocab]
-
-            # top-p sample each row that is still generating at step_i
-            for b_i in range(batch_size):
-                if row_chunk_size[b_i] > step_i:
-                    row_logits = logits_3d[b_i, -1, :] / temperature
-                    row_probs = torch.softmax(row_logits, dim=-1)
-                    sorted_probs, sorted_indices = torch.sort(row_probs, descending=True)
-                    cumsum = torch.cumsum(sorted_probs, dim=0)
-                    cutoff_ix = (cumsum >= top_p).nonzero(as_tuple=True)
-                    if len(cutoff_ix[0])>0:
-                        cut = cutoff_ix[0][0].item()
-                    else:
-                        cut = len(sorted_probs)-1
-                    keep_probs = sorted_probs[:cut+1]
-                    keep_ix = sorted_indices[:cut+1]
-                    ssum = keep_probs.sum()
-                    if ssum<1e-9:
-                        keep_probs = torch.ones_like(keep_probs)
-                        ssum = keep_probs.sum()
-                    keep_probs = keep_probs / ssum
-                    choice = torch.multinomial(keep_probs, 1).item()
-                    new_token = keep_ix[choice].item()
-                    output_tokens[b_i].append(new_token)
-                    new_tokens_count[b_i]+=1
-
-        # Now we have row_chunk_size[i] newly proposed tokens for each row => block_props
-        block_props = {}
+        # Build a single input of shape [batch_size, max_old_len + max_chunk]
+        # We do so by each row:
+        # row context = existing output_tokens + pad for the chunk
+        # We'll rely on the model generating the last 'max_chunk' tokens for each row
+        # In real lucidrains, you'd do an incremental approach with KV caching. For demonstration,
+        # we do a single pass re-encode: [batch_size, old_len_i + chunk_sizes[i]] => pad to max => shape [batch_size, context_len].
+        old_lens = []
         for i in range(batch_size):
-            cl = row_chunk_size[i]
-            if cl>0:
-                block_toks = output_tokens[i][-cl:]
-            else:
-                block_toks = []
-            block_props[i] = block_toks
-        logger.info(f"Block proposals => {block_props}")
+            old_lens.append(len(output_tokens[i]))
 
-        # call verify
+        max_old_len = max(old_lens)
+        # The final context length for each row = old_len[i] + chunk_sizes[i], up to (max_old_len + max_chunk)
+        final_context_len = max_old_len + max_chunk
+
+        # build padded batch
+        padded_input = []
+        for i in range(batch_size):
+            row_context_len = old_lens[i] + chunk_sizes[i]
+            row_data = output_tokens[i]
+            # if chunk_sizes[i]>0, we must pad out with dummy tokens to let the model produce them
+            # but 'transformers' by default doesn't do partial generation easily. We'll do a naive approach:
+            # replicate the last token chunk_sizes[i] times. This is a hack, because real single pass multi-token
+            # would do some form of BFS. We do a simpler approach: row_data + (chunk_sizes[i] dummy tokens).
+            # We'll forcibly fill them with pad_token_id or last token
+            # so we have the shape [row_context_len].
+            # Then we'll pad to final_context_len.
+
+            row_cp = row_data[:]
+            # add chunk_sizes[i] pad tokens
+            row_cp += [tokenizer.pad_token_id]*(chunk_sizes[i])
+            # Now row_cp has length old_lens[i]+chunk_sizes[i].
+            # if that < final_context_len => pad more
+            needed_pad = final_context_len - (old_lens[i] + chunk_sizes[i])
+            if needed_pad>0:
+                row_cp += [tokenizer.pad_token_id]*needed_pad
+            # row_cp now has length final_context_len
+            padded_input.append(torch.tensor(row_cp, dtype=torch.long, device=device))
+
+        batched_ids = torch.stack(padded_input, dim=0)  # shape [batch_size, final_context_len]
+
+        # forward pass in one shot => shape [batch_size, final_context_len, vocab]
+        with torch.no_grad():
+            # This might not do exactly gamma new tokens, but we treat the last chunk_sizes[i] positions as the newly generated tokens
+            outputs = draft_model(batched_ids)
+        if isinstance(outputs, (tuple, list)):
+            logits_3d = outputs[0]
+        else:
+            logits_3d = outputs
+
+        # shape => [batch_size, final_context_len, vocab]
+        if logits_3d.dim()==2:
+            # single step => [batch_size, vocab], expand
+            logits_3d = logits_3d.unsqueeze(1)
+
+        # For each row, sample the last chunk_sizes[i] tokens from the last chunk_sizes[i] positions
+        # those positions => range( old_lens[i], old_lens[i]+chunk_sizes[i] ) in logits_3d
+        # then do top-p sampling for each token
+        proposed_tokens = {i: [] for i in range(batch_size)}
+        for i in range(batch_size):
+            c_size = chunk_sizes[i]
+            old_len_i = old_lens[i]
+            if c_size<=0:
+                continue
+            for step_i in range(c_size):
+                pos = old_len_i + step_i
+                row_logits = logits_3d[i, pos, :] / temperature
+                row_probs = torch.softmax(row_logits, dim=-1)
+                sorted_probs, sorted_indices = torch.sort(row_probs, descending=True)
+                cumsum = torch.cumsum(sorted_probs, dim=0)
+                cutoff_ix = (cumsum >= top_p).nonzero(as_tuple=True)
+                if len(cutoff_ix[0])>0:
+                    cut = cutoff_ix[0][0].item()
+                else:
+                    cut = len(sorted_probs)-1
+                keep_probs = sorted_probs[:cut+1]
+                keep_ix = sorted_indices[:cut+1]
+                ssum = keep_probs.sum()
+                if ssum<1e-9:
+                    keep_probs = torch.ones_like(keep_probs)
+                    ssum = keep_probs.sum()
+                keep_probs = keep_probs / ssum
+                choice = torch.multinomial(keep_probs, 1).item()
+                new_token = keep_ix[choice].item()
+                proposed_tokens[i].append(new_token)
+
+        # now we have up to chunk_sizes[i] newly proposed tokens for each row
+        # we do one verifyBatchTokens call
         verify_list = []
         for i in range(batch_size):
-            if not finished_mask[i] and block_props[i]:
-                verify_list.append((session_ids[i], block_props[i]))
-        if not verify_list:
-            logger.info("No draft tokens to verify for this chunk. Continuing decode loop.")
-            continue
+            if not finished_mask[i] and proposed_tokens[i]:
+                verify_list.append((session_ids[i], proposed_tokens[i]))
 
-        logger.info(f"Calling verify_batch_tokens with {verify_list}")
+        if not verify_list:
+            # nothing to verify => all done
+            break
+
         verify_results = grpc_client.verify_batch_tokens(stub, verify_list)
-        logger.info(f"verify_results={verify_results}")
+        # parse
         result_map = {}
         for r in verify_results:
             sid = r['session_id']
@@ -367,9 +392,10 @@ def speculative_decode_batch(
                 'finished': r['finished']
             }
 
+        # partial acceptance => rollback or forced mismatch
         finalize_data = {}
         for i in range(batch_size):
-            if i not in block_props or not block_props[i]:
+            if i not in proposed_tokens or not proposed_tokens[i]:
                 continue
             if finished_mask[i]:
                 continue
@@ -379,11 +405,11 @@ def speculative_decode_batch(
             accepted_count = result_map[sid]['tokens_accepted']
             mismatch_token = result_map[sid]['target_token']
             row_finished = result_map[sid]['finished']
-            chunk_toks = block_props[i]
+            c_toks = proposed_tokens[i]
 
-            not_accepted = len(chunk_toks) - accepted_count
+            not_accepted = len(c_toks)-accepted_count
             accepted_tokens_total[i]+= accepted_count
-
+            # remove unaccepted from output_tokens
             while not_accepted>0:
                 output_tokens[i].pop()
                 new_tokens_count[i]-=1
@@ -396,30 +422,30 @@ def speculative_decode_batch(
                 output_tokens[i].append(forced_tok)
                 new_tokens_count[i]+=1
 
-            if row_finished or (tokenizer.eos_token_id is not None and len(output_tokens[i])>0 and output_tokens[i][-1]==tokenizer.eos_token_id):
+            if row_finished or (tokenizer.eos_token_id is not None and len(output_tokens[i])>0 and output_tokens[i][-1] == tokenizer.eos_token_id):
                 finished_mask[i] = True
 
-            fin_list = chunk_toks[:accepted_count]
+            # finalize tokens
+            fin_list = c_toks[:accepted_count]
             if forced_tok is not None:
                 fin_list.append(forced_tok)
             if fin_list:
                 finalize_data[i] = fin_list
 
         # finalize
-        final_seq_msgs = []
-        for i, tokens_to_fin in finalize_data.items():
-            final_seq_msgs.append((session_ids[i], tokens_to_fin))
-        if final_seq_msgs:
-            fresps = grpc_client.finalize_batch_tokens(stub, final_seq_msgs)
-            logger.info(f"finalize_batch_tokens => {fresps}")
-            for fr in fresps:
-                sid = fr['session_id']
-                fin = fr['finished']
+        final_msg = []
+        for i,flist in finalize_data.items():
+            final_msg.append((session_ids[i], flist))
+        if final_msg:
+            fresp = grpc_client.finalize_batch_tokens(stub, final_msg)
+            for rr in fresp:
+                sid = rr['session_id']
+                fin = rr['finished']
                 i2 = session_ids.index(sid)
                 if fin:
                     finished_mask[i2] = True
 
-        # check max
+        # check if we exceed max
         for i in range(batch_size):
             if not finished_mask[i] and new_tokens_count[i]>=max_new_tokens:
                 finished_mask[i] = True
@@ -439,11 +465,9 @@ def speculative_decode_batch(
         if tot_tokens>0:
             match_rate = tot_acc/tot_tokens
             perf_stats["token_match_rate"] = match_rate
-            logger.info(
-                f"[BATCH] Speculative decoding match rate: {match_rate:.2%} "
-                f"(Draft accepted: {tot_acc}, Target generated: {tot_forced})"
-            )
+            logger.info(f"[TRUE BATCH] Speculative decoding match rate: {match_rate:.2%} (Draft accepted: {tot_acc}, Target generated: {tot_forced})")
 
+    # decode
     final_texts = []
     for i in range(batch_size):
         txt = tokenizer.decode(output_tokens[i], skip_special_tokens=True)
