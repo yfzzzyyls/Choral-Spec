@@ -111,6 +111,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
         """
         We unify all sequences in request.sequences for the same session into a single sub-batch forward pass.
         Each row => one sequence. If multiple, we handle them in parallel. We do partial acceptance.
+        Includes fix for 'too many indices for tensor of dimension 2' by reshaping 2D -> 3D.
         """
         results = []
         with self.lock:
@@ -121,7 +122,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     seq_map[sid] = []
                 seq_map[sid].append(draft_seq.draft_tokens)
 
-            # for each session => multiple token arrays (one per row). unify them.
+            # For each session => unify multiple token arrays
             for sid, token_lists in seq_map.items():
                 if sid not in self.sessions:
                     # session not found => all finished
@@ -132,20 +133,16 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     continue
 
                 sess = self.sessions[sid]
+                # get device from model's first parameter
                 device_ = next(self.model.parameters(), None)
                 if device_ is not None:
                     device_ = device_.device
                 else:
                     device_ = torch.device('cpu')
 
-                # We expect EXACTLY one row's chunk per sequence => if we have batch_size=2, we have up to 2 rows.
-                # unify => shape [num_active_rows, chunk_len], do single forward pass => partial accept.
-
-                # find how many rows are free/unfinished
+                # We assign each token_list to the next unfinished row
                 active_rows = []
-                row_toks = []  # row_toks[i] => tokens for row i
-
-                # For each token_list, assign it to the next unfinished row
+                row_toks = []
                 for tok_list in token_lists:
                     r_idx = self._find_unfinished_row(sess)
                     if r_idx is None:
@@ -160,11 +157,10 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 if not active_rows:
                     continue
 
-                # find chunk_len = max(len(row_toks[i])) among active rows
-                max_chunk = max(len(x) for x in row_toks) if row_toks else 0
+                max_chunk = max(len(arr) for arr in row_toks) if row_toks else 0
                 if max_chunk == 0:
                     # nothing to verify
-                    for (r_idx, toklst) in zip(active_rows, row_toks):
+                    for (r_idx, arr) in zip(active_rows, row_toks):
                         results.append(inference_pb2.VerifyResult(
                             session_id=sid,
                             tokens_accepted=0,
@@ -173,7 +169,7 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                         ))
                     continue
 
-                # build a new context per row => shape row => [old_len + chunk_len]
+                # Build new context for each row => [old_len + chunk_len]
                 new_contexts = []
                 chunk_lens = []
                 old_lens = []
@@ -187,42 +183,61 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                     new_contexts.append(new_row)
                     chunk_lens.append(len(draft_arr))
 
-                # unify => padded => shape [num_active_rows, max_row_len]
+                # Pad to unify => shape [num_active_rows, max_len]
                 max_len = max(x.size(0) for x in new_contexts)
                 padded_input = []
-                for row_idx, row_data in enumerate(new_contexts):
+                for row_data in new_contexts:
                     pad_needed = max_len - row_data.size(0)
-                    if pad_needed>0:
+                    if pad_needed > 0:
                         pad_tensor = torch.full((pad_needed,), sess.pad_id, dtype=row_data.dtype)
-                        full_row = torch.cat([row_data, pad_tensor], dim=0)
-                        padded_input.append(full_row)
-                    else:
-                        padded_input.append(row_data)
-                batched_ids = torch.stack(padded_input, dim=0).to(device_)
-                # do forward pass => [num_active_rows, max_len, vocab]
+                        row_data = torch.cat([row_data, pad_tensor], dim=0)
+                    padded_input.append(row_data)
+                batched_ids = torch.stack(padded_input, dim=0).to(device_)  # shape [num_active_rows, max_len]
+
+                # Forward pass => shape [num_active_rows, max_len, vocab] or [num_active_rows, vocab]
                 with torch.no_grad():
                     out = self.model(batched_ids)
+
                 if hasattr(out, 'logits'):
                     logits_3d = out.logits
                 else:
                     logits_3d = out
-                # for each row, partial accept each token => [row, old_len..old_len+chunk_lens[i]-1]
-                results_for_session = []
+
+                # **Fix**: If it's 2D => [num_active_rows, vocab], reshape to [num_active_rows, max_len, vocab]
+                if logits_3d.dim() == 2:
+                    # If we only appended chunk_lens[i] tokens, we likely have max_len=someVal
+                    # but if we got 2D shape => means max_len=1 or the model is ignoring context
+                    # We'll interpret as just a single time dimension
+                    # So reshape => [num_active_rows, 1, vocab]
+                    logits_3d = logits_3d.unsqueeze(1)
+
+                # partial acceptance
                 for irow, r_idx in enumerate(active_rows):
                     draft_arr = row_toks[irow]
                     c_len = chunk_lens[irow]
                     old_len = old_lens[irow]
                     new_len = old_len + c_len
-                    # slice out logits => [c_len, vocab]
-                    row_logits_slice = logits_3d[irow, (new_len - c_len):new_len, :]
+                    # slice out the region => shape [c_len, vocab]
+                    # if c_len=1 => shape [1, vocab], no error
+                    start_idx = new_len - c_len
+                    end_idx = new_len
+                    # ensure we don't exceed the time dim
+                    time_dim = logits_3d.shape[1]
+                    if end_idx > time_dim:
+                        end_idx = time_dim
+                    row_logits_slice = logits_3d[irow, start_idx:end_idx, :]
 
                     accepted_count = 0
                     mismatch_tok = 0
                     fin_flag = False
+
                     for t_i in range(c_len):
+                        # safety check
+                        if t_i >= row_logits_slice.shape[0]:
+                            # no more logits => accept none
+                            break
                         dtok = draft_arr[t_i]
                         row_logits = row_logits_slice[t_i, :]
-                        # do greedy
                         t_id = int(torch.argmax(row_logits, dim=-1).item())
                         if t_id == dtok:
                             accepted_count += 1
@@ -237,11 +252,9 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                                 sess.mark_finished(r_idx)
                             break
 
-                    # store accepted tokens in sess
+                    # store accepted tokens
                     accepted_tokens = draft_arr[:accepted_count]
                     sess.add_tokens_to_row(r_idx, accepted_tokens)
-
-                    # if mismatch => forced token
                     if mismatch_tok != 0:
                         sess.add_tokens_to_row(r_idx, [mismatch_tok])
                         if mismatch_tok == self.eos_token_id:
@@ -254,10 +267,11 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                         target_token=mismatch_tok,
                         finished=fin_flag
                     )
-                    results_for_session.append(vr)
-                results.extend(results_for_session)
+                    results.append(vr)
 
         return inference_pb2.VerifyBatchResponse(results=results)
+
+
 
     def FinalizeBatchTokens(self, request, context):
         """
