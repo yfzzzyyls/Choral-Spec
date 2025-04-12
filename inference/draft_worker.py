@@ -52,24 +52,39 @@ def run_batched_prompt_file(
     temperature: float = 1.0
 ):
     """
-    Reads all prompts from a text file, tokenizes them in a single batch, and performs
-    real batched speculative decoding using `speculative_decode_batch`.
+    Reads N prompts from prompt_text_file, merges them into a single batch of size N 
+    (for example, 2 if you have exactly 2 prompts), and uses one session_id for the entire batch. 
+    We call StartGeneration once, do a single "batch finalize" of the prompts, 
+    then call speculative_decode_batch to proceed.
     """
+    import os
+    import torch
+    import logging
+    from transformers import AutoTokenizer
+    from grpc_comm import inference_pb2, inference_pb2_grpc, grpc_client
+    from inference.model_loader import load_model
+    from datetime import datetime
+    logger = logging.getLogger(__name__)
+
     if not os.path.exists(prompt_text_file):
         logger.error(f"Prompt text file not found: {prompt_text_file}")
         return
+
     with open(prompt_text_file, 'r', encoding='utf-8') as f:
         prompts = [line.strip() for line in f if line.strip()]
     if not prompts:
         logger.error("No valid lines in the prompt file.")
         return
 
+    batch_size = len(prompts)
+    logger.info(f"Found {batch_size} prompts in {prompt_text_file}. This code assumes you compiled batch_size={batch_size}.")
+
+    # Load local draft
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length}) for batched decoding...")
     draft_model = load_model(draft_model_name, sequence_length=sequence_length)
     tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
     if tokenizer.pad_token_id is None:
-        # set the pad token to eos if not defined
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if no_target:
@@ -78,24 +93,26 @@ def run_batched_prompt_file(
 
     address = f"{target_host}:{port}"
     logger.info(f"Connecting to target server at {address}...")
+    import grpc
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # Start a session for each prompt
-    session_ids = []
-    for prompt in prompts:
-        sid = _gen_session_id()
-        session_ids.append(sid)
-        stub.StartGeneration(
-            inference_pb2.StartRequest(
-                session_id=sid,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                gamma=gamma
-            )
+    # We now create exactly ONE session_id for the entire batch
+    import uuid
+    session_id = int(uuid.uuid4()) & 0xFFFFFFFF
+    # Start generation with a placeholder prompt
+    # (the actual prompt is passed in a finalize step below)
+    stub.StartGeneration(
+        inference_pb2.StartRequest(
+            session_id=session_id,
+            prompt="(placeholder for multi-prompt batch)",
+            max_new_tokens=max_new_tokens,
+            gamma=gamma
         )
+    )
+    logger.info(f"Created single session_id={session_id} for all {batch_size} prompts.")
 
-    # Tokenize all prompts in a batch
+    # Now, unify all prompts into a single batch of shape [batch_size, seq_len] on the draft side
     enc = tokenizer(
         prompts,
         return_tensors='pt',
@@ -105,8 +122,25 @@ def run_batched_prompt_file(
     input_ids_batch = enc["input_ids"]  # [batch_size, seq_len]
     attention_mask_batch = enc["attention_mask"]  # [batch_size, seq_len]
 
-    logger.info(f"Beginning real batch speculative decoding for {len(prompts)} prompts...")
+    # We'll do an initial 'FinalizeBatchTokens' to pass the entire prompt to the target in one shot.
+    # That way, the target side has shape [batch_size, prompt_len].
+    # We treat each row as separate "tokens" for finalize
+    # In your older code, finalize expects a single row per request => let's adapt 
+    # We'll unify them as separate calls or just unify them in a single call if your proto supports repeated sequences
+    # For demonstration, do multiple calls: each row => one FinalizeSequence
+    finalize_seq_msgs = []
+    for i in range(batch_size):
+        # extract the real prompt tokens
+        row = input_ids_batch[i, : attention_mask_batch[i].sum()].tolist()
+        finalize_seq_msgs.append((session_id, row))
 
+    # finalize them
+    final_resps = grpc_client.finalize_batch_tokens(stub, finalize_seq_msgs)
+    # the target now has shape [batch_size, prompt_len], if your code merges them. 
+    # Or if your code stores them as single row, you'd do advanced merging in the target.
+
+    logger.info("All prompts have been finalized onto the target's context. Now we do the speculative decode loop.")
+    from inference.speculative import speculative_decode_batch
     final_texts, perf_stats = speculative_decode_batch(
         draft_model,
         tokenizer,
@@ -118,16 +152,36 @@ def run_batched_prompt_file(
         profile=profile,
         top_p=top_p,
         temperature=temperature,
-        session_ids=session_ids
+        session_ids=[session_id]*batch_size  # same session for all rows
     )
 
-    # Print results
     print("\n=== Final Outputs (TRUE BATCH) ===")
     for i, text in enumerate(final_texts):
         print(f"[Prompt {i}]:\n{text}\n")
 
+    # optionally save perf stats
     if profile and perf_stats:
-        save_perf_stats(perf_stats, file_prefix="performance_speculative_batch")
+        from datetime import datetime
+        import json
+        file_prefix = "performance_speculative_batch"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = f"{file_prefix}_{timestamp}.csv"
+        json_path = f"{file_prefix}_{timestamp}.json"
+        try:
+            with open(csv_path, "w", newline='') as cf:
+                cf.write("total_time,tokens_generated,throughput,avg_token_time,token_match_rate\n")
+                total_time = perf_stats.get("total_time", 0.0)
+                tokens_generated = perf_stats.get("tokens_generated", 0)
+                throughput = perf_stats.get("throughput", 0.0)
+                avg_token_time = perf_stats.get("avg_token_time", 0.0)
+                token_match_rate = perf_stats.get("token_match_rate", None)
+                line = f"{total_time:.6f},{tokens_generated},{throughput:.6f},{avg_token_time:.6f},{token_match_rate}\n"
+                cf.write(line)
+            with open(json_path, "w") as jf:
+                json.dump(perf_stats, jf, indent=2)
+            logger.info(f"Performance metrics saved to {csv_path} and {json_path}")
+        except Exception as e:
+            logger.error(f"Failed to save performance data: {e}")
 
 
 def run_client(draft_model_name: str,
