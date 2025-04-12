@@ -56,7 +56,7 @@ def compile_model(model_path: str, sequence_length: int = DEFAULT_SEQUENCE_LENGT
     if model_type.lower() == "llama" or "llama" in model_path.lower():
         # Compile using optimized LLaMA class for Neuron
         logger.info(f"Compiling model using optimized LLaMA for Neuron ...")
-        model = LlamaForSampling.from_pretrained(model_path, batch_size=2, amp='bf16',
+        model = LlamaForSampling.from_pretrained(model_path, batch_size=1, amp='bf16',
                                                  n_positions=sequence_length, tp_degree=tp_degree)
         model.to_neuron()  # This triggers the Neuron compilation
         return model
