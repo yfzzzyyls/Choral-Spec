@@ -423,8 +423,8 @@ def speculative_decode_batch(
             match_rate = tot_acc/tot_tokens
             perf_stats["token_match_rate"] = match_rate
             logger.info(
-                f\"[BATCH] Speculative decoding match rate: {match_rate:.2%} \"
-                f\"(Draft accepted: {tot_acc}, Target generated: {tot_forced})\"
+                f"[BATCH] Speculative decoding match rate: {match_rate:.2%} "
+                f"(Draft accepted: {tot_acc}, Target generated: {tot_forced})"
             )
 
     final_texts = []
