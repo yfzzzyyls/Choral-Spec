@@ -308,15 +308,25 @@ def speculative_decode_batch(
             # forward pass draft model with sub_batch_size
             # we do not handle a past cache for now (or we do partial?), let's keep it simple
             outputs = draft_model(input_ids=sub_tokens_tensor)
-            # if the model returns a single tensor, assume shape [sub_batch_size, 1, vocab]
-            # if it returns a tuple, parse out (logits, ...)
-
             if isinstance(outputs, tuple) and len(outputs) >= 1:
+                # Some models return (logits, ...)
                 logits = outputs[0]
             else:
+                # If a single tensor
                 logits = outputs
-            # shape [sub_batch_size, 1, vocab]
-            logits = logits[:, -1, :]  # shape [sub_batch_size, vocab]
+
+            # Handle either [sub_batch_size, 1, vocab] or [sub_batch_size, vocab]
+            if logits.dim() == 3:
+                # e.g., shape [sub_batch_size, 1, vocab]
+                logits = logits[:, -1, :]  # becomes [sub_batch_size, vocab]
+            elif logits.dim() == 2:
+                # already [sub_batch_size, vocab], do nothing
+                pass
+            else:
+                # unexpected shape
+                raise ValueError(f"Draft model returned logits of shape {logits.shape}, expected 2D or 3D.")
+
+            # Now logits is [sub_batch_size, vocab]
 
             # sample next token for each row
             probs = torch.softmax(logits / temperature, dim=-1)
