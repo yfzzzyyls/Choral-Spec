@@ -1,6 +1,3 @@
-# ==========================
-# 4) draft_worker.py
-# ==========================
 import logging
 import grpc
 import os
@@ -12,7 +9,7 @@ from datetime import datetime
 
 from grpc_comm import inference_pb2_grpc, inference_pb2, grpc_client
 from inference.model_loader import load_model
-from inference.speculative import speculative_decode
+from inference.speculative import speculative_decode, speculative_decode_batch
 from transformers import AutoTokenizer
 import torch
 
@@ -20,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 
 def save_perf_stats(perf_stats: dict, file_prefix: str):
-    # same as existing
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = f"{file_prefix}_{timestamp}.csv"
     json_path = f"{file_prefix}_{timestamp}.json"
@@ -55,7 +51,10 @@ def run_batched_prompt_file(
     top_p: float = 0.9,
     temperature: float = 1.0
 ):
-    """Reads all prompts from a text file, processes them in a single batch on one thread."""
+    """
+    Reads all prompts from a text file, tokenizes them in a single batch, and performs
+    real batched speculative decoding using `speculative_decode_batch`.
+    """
     if not os.path.exists(prompt_text_file):
         logger.error(f"Prompt text file not found: {prompt_text_file}")
         return
@@ -69,21 +68,20 @@ def run_batched_prompt_file(
     draft_model = load_model(draft_model_name, sequence_length=sequence_length)
     tokenizer_source = target_tokenizer or draft_model_name
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=False)
+    if tokenizer.pad_token_id is None:
+        # set the pad token to eos if not defined
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if no_target:
-        logger.info("No target usage. We will just run the draft model locally in a single batch.")
-        # For demonstration, we won't implement a fully batch local decode here.
-        # This is left as an exercise or extension.
+        logger.info("No target usage. Just run the draft model locally (not implemented batch).")
         return
 
     address = f"{target_host}:{port}"
+    logger.info(f"Connecting to target server at {address}...")
     channel = grpc.insecure_channel(address)
     stub = inference_pb2_grpc.SpeculativeServiceStub(channel)
 
-    # We'll create a single session_id for each prompt, or we can unify them.
-    # For now, let's do one session per prompt, but handle them in a single pass.
-
-    # Step 1) StartGeneration for each prompt
+    # Start a session for each prompt
     session_ids = []
     for prompt in prompts:
         sid = _gen_session_id()
@@ -97,45 +95,39 @@ def run_batched_prompt_file(
             )
         )
 
-    # We'll keep track of partial output tokens for each session
-    # For a real batch approach, you'd do a single call to draft_model for all prompts.
-    # Then do a single verifyBatchTokens call, etc. We'll show a simplified approach here.
+    # Tokenize all prompts in a batch
+    enc = tokenizer(
+        prompts,
+        return_tensors='pt',
+        padding=True,
+        truncation=False
+    )
+    input_ids_batch = enc["input_ids"]  # [batch_size, seq_len]
+    attention_mask_batch = enc["attention_mask"]  # [batch_size, seq_len]
 
-    final_texts = [prompts[i] for i in range(len(prompts))]
-    finished_mask = [False]*len(prompts)
-    tokens_generated = [0]*len(prompts)
-    accepted_counts = [0]*len(prompts)
-    target_counts = [0]*len(prompts)
+    logger.info(f"Beginning real batch speculative decoding for {len(prompts)} prompts...")
 
-    # naive loop for demonstration: do up to max_new_tokens steps in batch
-    import time
-    start_time = time.time() if profile else None
+    final_texts, perf_stats = speculative_decode_batch(
+        draft_model,
+        tokenizer,
+        stub,
+        input_ids_batch,
+        attention_mask_batch,
+        max_new_tokens=max_new_tokens,
+        gamma=gamma,
+        profile=profile,
+        top_p=top_p,
+        temperature=temperature,
+        session_ids=session_ids
+    )
 
-    # This is a placeholder. Real batch decode means we combine the forward calls to the draft model.
-    # For now, let's do a loop in Python that calls speculative_decode for each prompt *in sequence.*
-    # That is not truly a single thread batch, but let's just show how you might unify them.
-
-    for i, prompt in enumerate(prompts):
-        logger.info(f"[BATCH] Decoding prompt {i}: {prompt}")
-        gen_text, perf_stats = speculative_decode(
-            draft_model, tokenizer, stub,
-            prompt, max_new_tokens, gamma,
-            profile=profile, top_p=top_p, temperature=temperature,
-            session_id=session_ids[i]
-        )
-        final_texts[i] = prompt + gen_text
-        if perf_stats:
-            accepted_counts[i] = perf_stats.get("accepted_tokens_total", 0)
-            target_counts[i] = perf_stats.get("target_tokens_total", 0)
-
-    end_time = time.time() if profile else None
-    if profile:
-        total_time = end_time - start_time
-        logger.info(f"Batched decode completed in {total_time:.2f}s.")
-
-    print("\n=== Final Outputs (BATCH approach) ===")
+    # Print results
+    print("\n=== Final Outputs (TRUE BATCH) ===")
     for i, text in enumerate(final_texts):
-        print(f"[Prompt {i} Output]:\n{text}\n")
+        print(f"[Prompt {i}]:\n{text}\n")
+
+    if profile and perf_stats:
+        save_perf_stats(perf_stats, file_prefix="performance_speculative_batch")
 
 
 def run_client(draft_model_name: str,
@@ -150,7 +142,6 @@ def run_client(draft_model_name: str,
                no_target: bool = False,
                top_p: float = 0.9,
                temperature: float = 1.0):
-    # same as existing
     logger.info(f"Loading draft model '{draft_model_name}' (sequence_length={sequence_length})...")
     draft_model = load_model(draft_model_name, sequence_length=sequence_length)
     tokenizer_source = target_tokenizer or draft_model_name
@@ -188,7 +179,6 @@ def run_client(draft_model_name: str,
 
 
 def _run_standalone_draft(draft_model, tokenizer, prompt, max_new_tokens, profile):
-    # same as existing
     output_text = ""
     input_ids = tokenizer(prompt, return_tensors='pt').input_ids
     tokens_generated = 0
@@ -229,7 +219,9 @@ def run_concurrent_clients(draft_model_name: str,
                            no_target: bool = False,
                            top_p: float = 0.9,
                            temperature: float = 1.0):
-    # same as existing concurrency approach
+    """
+    Old concurrency approach (1 thread per prompt). We keep it for backward compatibility.
+    """
     if not os.path.exists(prompt_text_file):
         logger.error(f"Prompt text file not found: {prompt_text_file}")
         return
