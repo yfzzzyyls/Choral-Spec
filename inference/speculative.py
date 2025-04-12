@@ -199,260 +199,274 @@ def speculative_decode(
 # Multi-sequence true batch decode (new code) #
 ###############################################
 
-def speculative_decode_batch(target_model, draft_model, input_ids, attention_mask=None,
-                              max_length=None, max_new_tokens=None, gamma=1, eos_token_id=None, pad_token_id=None):
+###############################################
+# Multi-sequence true batch decode (new code) #
+###############################################
+
+def speculative_decode_batch(
+    draft_model,
+    tokenizer,
+    stub,
+    input_ids_batch: torch.Tensor,
+    attention_mask_batch: torch.Tensor,
+    max_new_tokens: int = 50,
+    gamma: int = 4,
+    profile: bool = False,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    session_ids=None
+):
     """
-    Generate text using speculative decoding with a draft (small) and target (large) model.
-    Returns the generated tokens (including the initial prompt).
+    Performs real batch speculative decoding using a local `draft_model` and a remote target
+    via `stub` for verification. This version matches the call signature in `draft_worker.py`.
+
+    :param draft_model: The local draft model (PyTorch module compiled for Neuron). Must have `.device`.
+    :param tokenizer: Hugging Face tokenizer.
+    :param stub: A SpeculativeServiceStub to the remote target server (for verify/finalize calls).
+    :param input_ids_batch: A [batch_size, seq_len] tensor of token IDs.
+    :param attention_mask_batch: A [batch_size, seq_len] tensor of 1/0 indicating real/pad tokens.
+    :param max_new_tokens: Maximum tokens to generate for each sequence.
+    :param gamma: Number of draft tokens to propose before verifying.
+    :param profile: If True, measure performance.
+    :param top_p: Nucleus sampling threshold for the draft.
+    :param temperature: Sampling temperature for the draft.
+    :param session_ids: A list of session IDs, one per sequence, for the target.
+
+    :return: (final_texts, perf_stats) where final_texts is a list of decoded strings per sequence.
     """
-    # Move input to target model's device
-    input_ids = input_ids.to(target_model.device)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(target_model.device)
-    batch_size = input_ids.size(0)
-    
-    # Use model config for eos/pad tokens if not provided
-    if pad_token_id is None:
-        pad_token_id = getattr(target_model.config, 'pad_token_id', None)
-    if pad_token_id is None:
-        pad_token_id = eos_token_id if eos_token_id is not None else 0
-    if eos_token_id is None:
-        eos_token_id = getattr(target_model.config, 'eos_token_id', None)
-    
-    # Determine initial (prompt) lengths for each sequence
-    if attention_mask is not None:
-        prompt_lengths = attention_mask.sum(dim=1)  # number of non-pad tokens per sequence
-    else:
-        prompt_lengths = torch.tensor([input_ids.size(1)] * batch_size, device=input_ids.device)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-    
-    # Determine target total length (prompt + new tokens)
-    if max_length is not None:
-        target_lengths = torch.tensor([max_length] * batch_size, device=input_ids.device)
-    elif max_new_tokens is not None:
-        target_lengths = prompt_lengths + max_new_tokens
-    else:
-        raise ValueError("Must specify either max_length or max_new_tokens")
-    
-    def model_forward(model, input_ids, past=None, attention_mask=None):
-        """Runs model.forward() and returns (logits, past_key_values)."""
-        # Prepare kwargs for forward
-        kwargs = {'use_cache': True}
-        if attention_mask is not None:
-            kwargs['attention_mask'] = attention_mask
-        if past is not None:
-            # Use appropriate keyword for past key values
-            kwargs['past_key_values'] = past
-        outputs = model(input_ids=input_ids, **kwargs)
-        # Handle different output types
-        if hasattr(outputs, "logits"):
-            logits = outputs.logits
-            past_key_values = getattr(outputs, "past_key_values", None) or getattr(outputs, "past", None)
-        elif isinstance(outputs, (tuple, list)):
-            logits = outputs[0]
-            past_key_values = None
-            # Search for past in remaining outputs
-            for out in outputs[1:]:
-                if isinstance(out, (tuple, list)):
-                    past_key_values = out
-                    break
-        else:  # outputs is a single tensor (logits)
-            logits = outputs
-            past_key_values = None
-        return logits, past_key_values
-    
-    # Encode the initial prompt for both models to prime their caches
-    target_logits, past_target = model_forward(target_model, input_ids, past=None, attention_mask=attention_mask)
-    draft_logits, past_draft = model_forward(draft_model, input_ids, past=None, attention_mask=attention_mask)
-    # Save the target model’s next-token logits after the prompt (for first speculative token verification)
-    prev_target_next_logits = target_logits[:, -1, :]
-    
-    # Initialize generated output (start with prompt) and finished flags
-    out_ids = input_ids.clone()
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
-    
-    # Loop until all sequences are finished or reach the target length
-    while True:
-        # Compute current lengths and update finished flags
-        seq_lengths = attention_mask.sum(dim=1)
-        if eos_token_id is not None:
-            last_tokens = out_ids.gather(1, (seq_lengths - 1).clamp(min=0).unsqueeze(1)).squeeze(1)
-            finished |= (last_tokens == eos_token_id)
-        finished |= (seq_lengths >= target_lengths)  # also finish if length limit reached
-        if finished.all():
+
+    import time
+    import random
+
+    logger.info(f"Running speculative_decode_batch with batch_size={input_ids_batch.size(0)}")
+
+    # Determine device from draft_model
+    device = getattr(draft_model, 'device', torch.device('cpu'))
+    # Move inputs to device
+    input_ids_batch = input_ids_batch.to(device)
+    attention_mask_batch = attention_mask_batch.to(device)
+    batch_size = input_ids_batch.size(0)
+
+    if session_ids is None:
+        # create a random session ID for each sequence
+        from uuid import uuid4
+        session_ids = [(int(uuid4()) & 0xFFFFFFFF) for _ in range(batch_size)]
+
+    # We'll track output tokens for each sequence in a python list
+    output_tokens = [[] for _ in range(batch_size)]
+    # fill output_tokens with the existing prompt tokens from input_ids_batch (excluding pads)
+    prompt_lengths = attention_mask_batch.sum(dim=1).tolist()
+    for i in range(batch_size):
+        plen = prompt_lengths[i]
+        init_tokens = input_ids_batch[i, :plen].tolist()
+        output_tokens[i].extend(init_tokens)
+
+    finished_mask = [False]*batch_size
+    new_tokens_count = [0]*batch_size  # how many new tokens each sequence generated
+
+    start_time = time.time() if profile else None
+
+    accepted_tokens_total = [0]*batch_size
+    forced_tokens_total = [0]*batch_size
+
+    def all_finished():
+        return all(finished_mask)
+
+    # We'll do repeated cycles: draft proposes gamma tokens, stub verifies, we finalize
+    while not all_finished():
+        # gather active sequences
+        active_indices = [i for i, fin in enumerate(finished_mask) if not fin]
+        if not active_indices:
             break
-        
-        # Determine how many speculative tokens to generate this round (do not exceed needed tokens)
-        remaining_tokens = (target_lengths - seq_lengths).clamp(min=0)
-        spec_count = min(gamma, int(remaining_tokens.max().item())) if remaining_tokens.max() > 0 else gamma
-        
-        # Collect draft model logits and sampled tokens for this speculative batch
-        small_logits_list = []
-        spec_tokens = torch.zeros((batch_size, spec_count), dtype=torch.long, device=input_ids.device)
-        for t in range(spec_count):
-            # Prepare last tokens of each sequence (use pad for already finished sequences)
-            last_tokens = torch.where(
-                finished.unsqueeze(1),
-                torch.tensor(pad_token_id, device=input_ids.device).repeat(batch_size, 1),
-                out_ids.gather(1, (seq_lengths - 1).unsqueeze(1))
-            )
-            # Draft model forward for next token
-            logits, past_draft = model_forward(draft_model, last_tokens, past=past_draft)
-            next_logits = logits[:, -1, :]  # logits for the next token
-            small_logits_list.append(next_logits)
-            # Sample next token from draft model (multinomial sampling for each sequence)
-            probs = torch.softmax(next_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
-            # Use pad token for sequences that are finished (no actual generation)
-            next_token = torch.where(finished, torch.tensor(pad_token_id, device=input_ids.device), next_token)
-            # Append sampled token to outputs
-            spec_tokens[:, t] = next_token
-            out_ids = torch.cat([out_ids, next_token.unsqueeze(1)], dim=1)
-            # Update attention_mask (1 for real tokens, 0 for pads)
-            new_mask_col = (~finished).long().unsqueeze(1)
-            attention_mask = torch.cat([attention_mask, new_mask_col], dim=1)
-            seq_lengths = seq_lengths + (~finished).long()  # increment length for active sequences
-            # Update finished if EOS was generated
-            if eos_token_id is not None:
-                finished |= (next_token == eos_token_id)
-            if finished.all():
-                # All sequences finished during speculative generation
-                spec_count = t + 1  # update actual count of spec tokens generated
-                spec_tokens = spec_tokens[:, :spec_count]
-                small_logits_list = small_logits_list[:spec_count]
+
+        # propose up to gamma tokens for each active sequence
+        proposed_tokens = {i: [] for i in active_indices}
+
+        # We do token-by-token generation for up to gamma steps
+        for step in range(gamma):
+            if not active_indices:
                 break
-        
-        if finished.all():
-            break  # no need to verify if all are done
-        
-        # Verify speculative tokens with the target model
-        # Determine input to target model: new speculative tokens (if cache is available) or full sequence (if not)
-        if past_target is not None:
-            # Use cache: feed only the new tokens
-            verify_input_ids = spec_tokens
-            verify_mask = None  # not needed when using past (model sees these tokens as continuation)
-        else:
-            # No cache support: feed the entire current sequence with updated mask
-            verify_input_ids = out_ids
-            verify_mask = attention_mask
-        verify_logits, new_past_target = model_forward(target_model, verify_input_ids, past=past_target, attention_mask=verify_mask)
-        # Update or reset target model past based on availability
-        past_target = new_past_target if new_past_target is not None else None
-        
-        # Determine target model logits for each new token and for the token after them
-        if new_past_target is not None:
-            # If using cache, verify_logits shape = (batch, spec_count, vocab)
-            big_logits_new = verify_logits  # contains distributions after each new token
-            # Distribution after all new tokens (next-token distribution)
-            big_next_dist = big_logits_new[:, -1, :].unsqueeze(1)
-            # Big model distributions for each speculative token:
-            # For token1, use prev_target_next_logits (distribution after previous context);
-            # for token2..tokenN, use logits from positions 0..(N-2) of big_logits_new.
-            if spec_count > 1:
-                big_logits_for_tokens = torch.cat([prev_target_next_logits.unsqueeze(1), big_logits_new[:, :-1, :]], dim=1)
+            # build a sub-batch for the active sequences: each provides its last token as input
+            sub_inputs = []
+            for seq_idx in active_indices:
+                if len(proposed_tokens[seq_idx]) == step:
+                    # if step=0, we feed the last prompt token
+                    # else, feed the token we just generated
+                    if step == 0:
+                        # use the last prompt token
+                        plen = len(output_tokens[seq_idx])
+                        last_token_id = output_tokens[seq_idx][plen-1]
+                    else:
+                        last_token_id = proposed_tokens[seq_idx][-1]
+                    sub_inputs.append(last_token_id)
+            sub_batch_size = len(sub_inputs)
+            if sub_batch_size == 0:
+                break
+            # create input_ids of shape [sub_batch_size, 1]
+            sub_tokens_tensor = torch.tensor(sub_inputs, dtype=torch.long, device=device).unsqueeze(1)
+
+            # forward pass draft model with sub_batch_size
+            # we do not handle a past cache for now (or we do partial?), let's keep it simple
+            outputs = draft_model(input_ids=sub_tokens_tensor)
+            # if the model returns a single tensor, assume shape [sub_batch_size, 1, vocab]
+            # if it returns a tuple, parse out (logits, ...)
+
+            if isinstance(outputs, tuple) and len(outputs) >= 1:
+                logits = outputs[0]
             else:
-                big_logits_for_tokens = prev_target_next_logits.unsqueeze(1)
-        else:
-            # If re-encoded full sequence, verify_logits includes logits for all tokens so far.
-            # Extract logits for the last `spec_count` tokens and the token after them (spec_count+1 positions).
-            big_logits_seq = verify_logits[:, -(spec_count + 1):, :]
-            big_logits_for_tokens = big_logits_seq[:, :-1, :]  # logits corresponding to each new token
-            big_next_dist = big_logits_seq[:, -1, :].unsqueeze(1)  # distribution after all new tokens
-        # Stack draft model logits for speculative tokens
-        small_logits = torch.stack(small_logits_list, dim=1)  # shape (batch, spec_count, vocab)
-        
-        # Calculate log probabilities of each chosen speculative token under both models
-        big_log_probs = []   # shape (batch, spec_count)
-        small_log_probs = []  # shape (batch, spec_count)
-        for j in range(spec_count):
-            token_j = spec_tokens[:, j].unsqueeze(1)  # token IDs of j-th speculative token
-            # Big model log-prob for token j:
-            if j == 0:
-                # First speculative token: use distribution after previous context (prev_target_next_logits)
-                big_lp = torch.log_softmax(prev_target_next_logits, dim=-1).gather(1, token_j).squeeze(1)
-            else:
-                big_lp = torch.log_softmax(big_logits_for_tokens[:, j, :], dim=-1).gather(1, token_j).squeeze(1)
-            # Draft model log-prob for token j:
-            small_lp = torch.log_softmax(small_logits[:, j, :], dim=-1).gather(1, token_j).squeeze(1)
-            big_log_probs.append(big_lp)
-            small_log_probs.append(small_lp)
-        big_log_probs = torch.stack(big_log_probs, dim=1)     # (batch, spec_count)
-        small_log_probs = torch.stack(small_log_probs, dim=1)  # (batch, spec_count)
-        
-        # Decide how many of the speculative tokens to accept for each sequence
-        log_ratio = big_log_probs - small_log_probs  # log(p/q) for each token
-        ratio = torch.exp(log_ratio)                 # p_i / q_i for each speculative token
-        rand = torch.rand(ratio.shape, device=ratio.device)   # random threshold for each token
-        # Find first index where random > ratio (meaning token should be rejected)
-        reject_index = torch.full((batch_size,), spec_count, dtype=torch.long, device=input_ids.device)
-        for i in range(batch_size):
-            if finished[i]:
-                # Already finished sequences (no new tokens effectively added) – treat as accepting 0 new tokens
-                reject_index[i] = 0
-            else:
-                # find first speculative token to reject
-                idx = (rand[i] > ratio[i]).nonzero(as_tuple=True)
-                if len(idx[0]) > 0:
-                    reject_index[i] = int(idx[0][0])
-        # Number of tokens accepted = all tokens up to (reject_index-1) are accepted. If reject_index == spec_count, accept all.
-        accepted_counts = torch.where(reject_index < spec_count, reject_index, torch.tensor(spec_count, device=input_ids.device))
-        rejected_counts = spec_count - accepted_counts  # how many tokens to remove for each sequence
-        
-        # Remove rejected tokens from the outputs for each sequence
-        new_out_ids_list = []
-        new_mask_list = []
-        for i in range(batch_size):
-            seq_len = seq_lengths[i].item()  # length after adding spec_count tokens
-            keep = int(accepted_counts[i].item())  # number of new tokens to keep
-            # Calculate new sequence length after rejection
-            new_length = seq_len - spec_count + keep
-            # Slice sequence and mask to the new length
-            seq_tokens = out_ids[i, :new_length]
-            seq_mask = attention_mask[i, :new_length]
-            new_out_ids_list.append(seq_tokens)
-            new_mask_list.append(seq_mask)
-            # Update prompt_lengths for next iteration (context now includes accepted tokens)
-            prompt_lengths[i] = new_length
-        
-        # Pad sequences back to a uniform length for batch tensor
-        max_len = max(seq.size(0) for seq in new_out_ids_list)
-        out_ids = torch.full((batch_size, max_len), pad_token_id, dtype=out_ids.dtype, device=input_ids.device)
-        attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=input_ids.device)
-        for i in range(batch_size):
-            length = new_out_ids_list[i].size(0)
-            out_ids[i, :length] = new_out_ids_list[i]
-            attention_mask[i, :length] = new_mask_list[i]
-        # Update finished flags after truncation (in case EOS token was removed or sequence ended at EOS)
-        seq_lengths = attention_mask.sum(dim=1)
-        if eos_token_id is not None:
-            last_tokens = out_ids.gather(1, (seq_lengths - 1).clamp(min=0).unsqueeze(1)).squeeze(1)
-            finished |= (last_tokens == eos_token_id)
-        finished |= (seq_lengths >= target_lengths)
-        
-        # Update the target model's "previous next-token" logits for the next iteration.
-        # This should be the distribution after the final accepted token of this iteration’s context.
-        new_prev_logits = prev_target_next_logits.clone()
-        for i in range(batch_size):
-            if rejected_counts[i].item() > 0:
-                # If some tokens were rejected for sequence i
-                if accepted_counts[i].item() > 0:
-                    # Use big model distribution after the last accepted token
-                    idx = int(accepted_counts[i].item()) - 1
-                    new_prev_logits[i] = big_logits_for_tokens[i, idx, :]
+                logits = outputs
+            # shape [sub_batch_size, 1, vocab]
+            logits = logits[:, -1, :]  # shape [sub_batch_size, vocab]
+
+            # sample next token for each row
+            probs = torch.softmax(logits / temperature, dim=-1)
+            # top_p filtering if needed
+            next_tokens = []
+            for b_i in range(sub_batch_size):
+                row_probs = probs[b_i]
+                # do nucleus top_p
+                sorted_probs, sorted_indices = torch.sort(row_probs, descending=True)
+                cumulative = torch.cumsum(sorted_probs, dim=0)
+                cutoff = (cumulative >= top_p).nonzero()
+                if len(cutoff) > 0 and len(cutoff[0]) > 0:
+                    cutoff_idx = cutoff[0][0].item()
                 else:
-                    # No token accepted (rejected at first token) – distribution remains as it was (previous context)
-                    new_prev_logits[i] = prev_target_next_logits[i]
-            else:
-                # All speculative tokens accepted – use big model's distribution after all new tokens
-                new_prev_logits[i] = big_next_dist[i, 0, :]
-        prev_target_next_logits = new_prev_logits
-        # Note: `past_target` already contains the cache for prompt + spec_count tokens. If tokens were rejected, those cache entries 
-        # will not be used (they correspond to dropped tokens), but we continue with the accepted context. We rely on the updated 
-        # `prev_target_next_logits` and attention_mask to ensure correctness. If the model does not support external cache, `past_target` 
-        # is None and we re-encode full context each time (ensuring correctness at the cost of performance).
-    # End of while loop
-    
-    return out_ids
+                    cutoff_idx = len(sorted_probs)-1
+                keep_probs = sorted_probs[:cutoff_idx+1]
+                keep_indices = sorted_indices[:cutoff_idx+1]
+                keep_sum = keep_probs.sum()
+                if keep_sum < 1e-9:
+                    keep_probs = torch.ones_like(keep_probs)
+                    keep_sum = keep_probs.sum()
+                keep_probs = keep_probs / keep_sum
+                choice_idx = torch.multinomial(keep_probs, 1).item()
+                token_id = keep_indices[choice_idx].item()
+                next_tokens.append(token_id)
+
+            # assign these tokens to the correct sequences
+            b_i = 0
+            newly_finished = []
+            for seq_idx in active_indices:
+                if len(proposed_tokens[seq_idx]) == step:
+                    t_id = next_tokens[b_i]
+                    proposed_tokens[seq_idx].append(t_id)
+                    b_i += 1
+
+            # check EOS among them
+            eos_hits = []
+            for seq_idx in active_indices:
+                last_t = proposed_tokens[seq_idx][-1]
+                # if is EOS, mark finished
+                if tokenizer.eos_token_id is not None and last_t == tokenizer.eos_token_id:
+                    eos_hits.append(seq_idx)
+            if eos_hits:
+                for e in eos_hits:
+                    active_indices.remove(e)
+        # end gamma block
+
+        # now we verify using stub.VerifyBatchTokens
+        verify_list = []
+        for i in range(batch_size):
+            if not finished_mask[i] and proposed_tokens.get(i) and len(proposed_tokens[i])>0:
+                verify_list.append((session_ids[i], proposed_tokens[i]))
+        if not verify_list:
+            break
+        verify_results = grpc_client.verify_batch_tokens(stub, verify_list)
+        # parse the results
+        result_map = {}
+        for r in verify_results:
+            sid = r['session_id']
+            result_map[sid] = {
+                'tokens_accepted': r['tokens_accepted'],
+                'target_token': r['target_token'],
+                'finished': r['finished']
+            }
+        finalize_data = {}
+
+        for i in range(batch_size):
+            if i not in proposed_tokens or not proposed_tokens[i]:
+                continue
+            if finished_mask[i]:
+                continue
+            sid = session_ids[i]
+            if sid not in result_map:
+                continue
+            rr = result_map[sid]
+            accepted_count = rr['tokens_accepted']
+            mismatch_token = rr['target_token']
+            seq_finished = rr['finished']
+
+            block_toks = proposed_tokens[i]
+            block_len = len(block_toks)
+            accepted_tokens = block_toks[:accepted_count]
+
+            # add accepted tokens to output
+            output_tokens[i].extend(accepted_tokens)
+            accepted_tokens_total[i] += len(accepted_tokens)
+            new_tokens_count[i] += len(accepted_tokens)
+
+            if mismatch_token != 0:
+                output_tokens[i].append(mismatch_token)
+                forced_tokens_total[i] += 1
+                new_tokens_count[i] += 1
+
+            if seq_finished or (tokenizer.eos_token_id is not None and len(output_tokens[i])>0 and output_tokens[i][-1] == tokenizer.eos_token_id):
+                finished_mask[i] = True
+
+            # finalize tokens on target side
+            finalize_list = accepted_tokens[:]
+            if mismatch_token != 0:
+                finalize_list += [mismatch_token]
+            if finalize_list:
+                finalize_data[i] = finalize_list
+
+        # call finalize
+        fseq_list = []
+        for i in finalize_data:
+            sid = session_ids[i]
+            fseq_list.append((sid, finalize_data[i]))
+        if fseq_list:
+            fresp = grpc_client.finalize_batch_tokens(stub, fseq_list)
+            for r in fresp:
+                sid = r['session_id']
+                fin = r['finished']
+                i2 = session_ids.index(sid)
+                if fin:
+                    finished_mask[i2] = True
+
+        # check max_new_tokens
+        for i in range(batch_size):
+            if not finished_mask[i] and new_tokens_count[i] >= max_new_tokens:
+                finished_mask[i] = True
+
+    end_time = time.time() if profile else None
+    perf_stats = {}
+    if profile:
+        total_elapsed = end_time - start_time
+        total_accepted = sum(accepted_tokens_total)
+        total_forced = sum(forced_tokens_total)
+        total_tokens = total_accepted + total_forced
+        throughput = total_tokens / total_elapsed if total_elapsed>0 else 0.0
+        perf_stats["total_time"] = total_elapsed
+        perf_stats["tokens_generated"] = total_tokens
+        perf_stats["throughput"] = throughput
+        perf_stats["avg_token_time"] = total_elapsed / total_tokens if total_tokens>0 else 0.0
+        if total_tokens>0:
+            match_rate = total_accepted / total_tokens
+            perf_stats["token_match_rate"] = match_rate
+            logger.info(
+                f"[BATCH] Speculative decoding match rate: {match_rate:.2%} "
+                f"(Draft accepted: {total_accepted}, Target generated: {total_forced})"
+            )
+
+    # decode final text
+    final_texts = []
+    for i in range(batch_size):
+        text = tokenizer.decode(output_tokens[i], skip_special_tokens=True)
+        final_texts.append(text)
+
+    return final_texts, perf_stats
+
 
 
 def _sample_token_id(logits: torch.Tensor, top_p: float, temperature: float):
