@@ -130,7 +130,12 @@ class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
                 new_len = new_row.size(0)
 
                 # unify => shape [1, new_len]
-                batch_ids = new_row.unsqueeze(0).to(self.model.device)
+                device_ = next(self.model.parameters(), None)
+                if device_ is not None:
+                    device_ = device_.device
+                else:
+                    device_ = torch.device('cpu')
+                batch_ids = new_row.unsqueeze(0).to(device_)
 
                 with torch.no_grad():
                     out = self.model(batch_ids)
