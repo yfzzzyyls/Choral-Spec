@@ -6,14 +6,14 @@ import grpc
 from transformers_neuronx import NeuronAutoModelForCausalLM, NeuronConfig, GenerationConfig, compiler
 from transformers_neuronx.llama.model import LlamaForCausalLM
 
-import speculative_pb2
-import speculative_pb2_grpc
+from grpc_comm import inference_pb2
+from grpc_comm import inference_pb2_grpc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DraftWorker")
 
-class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
+class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
     def __init__(self):
         self.model = None
         self.generation_config = None
@@ -58,7 +58,7 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
             logger.info(f"Draft model compiled and loaded in {compile_time:.2f} seconds.")
         except Exception as e:
             logger.error(f"Failed to load draft model: {e}")
-            return speculative_pb2.LoadModelResponse(success=False, message=str(e))
+            return inference_pb2.LoadModelResponse(success=False, message=str(e))
         # Save generation config if provided in on_device_generation for reference
         # In this design, we will implement top_k, top_p, temperature sampling in code, 
         # so we can also store them here for use.
@@ -69,14 +69,14 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
             "temperature": 1.0,
             "do_sample": True
         }
-        return speculative_pb2.LoadModelResponse(success=True, message="Draft model loaded successfully")
+        return inference_pb2.LoadModelResponse(success=True, message="Draft model loaded successfully")
 
     def StartSession(self, request, context):
         """Initialize a decoding session with the given prompt (input IDs)."""
         session_id = request.session_id or f"draft-{len(self.sessions)+1}"
         input_ids = list(request.input_ids)
         if self.model is None:
-            return speculative_pb2.StartSessionResponse(session_id=session_id, success=False,
+            return inference_pb2.StartSessionResponse(session_id=session_id, success=False,
                                                         message="Model not loaded")
         try:
             # Prepare input tensors
@@ -94,10 +94,10 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
                 "state_cache_stack": []  # will hold intermediate states during draft generation
             }
             logger.info(f"Draft session {session_id} initialized (prompt length = {len(input_ids)} tokens).")
-            return speculative_pb2.StartSessionResponse(session_id=session_id, success=True, message="Session started")
+            return inference_pb2.StartSessionResponse(session_id=session_id, success=True, message="Session started")
         except Exception as e:
             logger.error(f"Error in StartSession for draft model: {e}")
-            return speculative_pb2.StartSessionResponse(session_id=session_id, success=False, message=str(e))
+            return inference_pb2.StartSessionResponse(session_id=session_id, success=False, message=str(e))
 
     def GenerateDraft(self, request, context):
         """Generate a speculative sequence of draft tokens for one or more sessions."""
@@ -108,10 +108,10 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
         if draft_length == 0:
             # Nothing to generate
             for sid in session_ids:
-                results.append(speculative_pb2.GenerateDraftResponse.DraftOutput(
+                results.append(inference_pb2.GenerateDraftResponse.DraftOutput(
                     session_id=sid, tokens=[], probabilities=[]
                 ))
-            return speculative_pb2.GenerateDraftResponse(outputs=results)
+            return inference_pb2.GenerateDraftResponse(outputs=results)
         # Process each session sequentially (could be optimized to batch, see note below)
         for sid in session_ids:
             state = self.sessions.get(sid)
@@ -201,7 +201,7 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
                 logger.error(f"Error during draft generation for session {sid}: {e}")
                 # If any error, break out (we can return partial tokens or handle error differently)
             # Append result for this session
-            results.append(speculative_pb2.GenerateDraftResponse.DraftOutput(
+            results.append(inference_pb2.GenerateDraftResponse.DraftOutput(
                 session_id=sid,
                 tokens=tokens,
                 probabilities=probs
@@ -209,7 +209,7 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
             logger.info(f"Draft model generated {len(tokens)} tokens for session {sid}: {tokens}")
         elapsed = time.time() - start_time
         logger.info(f"GenerateDraft completed for {len(session_ids)} session(s) in {elapsed:.3f}s")
-        return speculative_pb2.GenerateDraftResponse(outputs=results)
+        return inference_pb2.GenerateDraftResponse(outputs=results)
 
     def UpdateDraftContext(self, request, context):
         """Roll back the draft model state and integrate the target model's new token."""
@@ -218,7 +218,7 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
         new_token = request.new_token
         state = self.sessions.get(session_id)
         if state is None:
-            return speculative_pb2.UpdateDraftContextResponse(success=False, message="Session not found")
+            return inference_pb2.UpdateDraftContextResponse(success=False, message="Session not found")
         try:
             # Roll back to state after 'accepted_count' tokens
             if "state_cache_stack" in state and state["state_cache_stack"]:
@@ -242,14 +242,14 @@ class DraftServicer(speculative_pb2_grpc.DraftServiceServicer):
             # Clear intermediate stack as it's no longer needed after context update
             state["state_cache_stack"] = []
             logger.info(f"Draft session {session_id} rolled back to {accepted_count} accepted tokens and integrated target token {new_token}.")
-            return speculative_pb2.UpdateDraftContextResponse(success=True, message="Draft context updated")
+            return inference_pb2.UpdateDraftContextResponse(success=True, message="Draft context updated")
         except Exception as e:
             logger.error(f"Error in UpdateDraftContext for session {session_id}: {e}")
-            return speculative_pb2.UpdateDraftContextResponse(success=False, message=str(e))
+            return inference_pb2.UpdateDraftContextResponse(success=False, message=str(e))
 
 def serve(port=50051):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    speculative_pb2_grpc.add_DraftServiceServicer_to_server(DraftServicer(), server)
+    inference_pb2_grpc.add_DraftServiceServicer_to_server(DraftServicer(), server)
     server.add_insecure_port(f"[::]:{port}")
     logger.info(f"Starting DraftService gRPC server on port {port}...")
     server.start()
