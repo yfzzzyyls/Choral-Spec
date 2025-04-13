@@ -1,292 +1,224 @@
-import logging
+import time
 import torch
+import math
+import logging
 from concurrent import futures
 import grpc
+from transformers_neuronx import NeuronAutoModelForCausalLM, NeuronConfig, GenerationConfig
 
-from inference import model_loader
-from transformers import AutoTokenizer
-from grpc_comm import inference_pb2, inference_pb2_grpc
+from grpc_comm import inference_pb2
+from grpc_comm import inference_pb2_grpc
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TargetWorker")
 
-class BatchedTargetSession:
-    """
-    Holds a [batch_size, seq_len] tensor for multiple sequences in parallel, plus a 'finished' mask.
-    We store up to batch_size rows. Each row_i corresponds to one prompt.
-    """
-    def __init__(self, batch_size=2, initial_seq_len=0, pad_token_id=0):
-        # Start with shape [batch_size, initial_seq_len]
-        self.batch_size = batch_size
-        self.seq_len = initial_seq_len
-        self.pad_id = pad_token_id
-        if initial_seq_len == 0:
-            # shape [batch_size, 0], we'll expand columns as needed
-            self.current_ids = torch.zeros((batch_size, 0), dtype=torch.long)
-        else:
-            self.current_ids = torch.full((batch_size, initial_seq_len), pad_token_id, dtype=torch.long)
-        self.row_lengths = [0]*batch_size  # how many tokens each row uses
-        self.finished_mask = [False]*batch_size
+class TargetServicer(inference_pb2_grpc.TargetServiceServicer):
+    def __init__(self):
+        self.model = None
+        self.generation_config = None
+        self.sessions = {}  # session_id -> state dict
 
-    def is_all_finished(self):
-        return all(self.finished_mask)
+    def LoadModel(self, request, context):
+        """Load and compile the target model on Neuron cores."""
+        model_path = request.model_path
+        n_positions = request.n_positions or 1024
+        batch_size = request.batch_size or 1
+        tp_degree = request.tp_degree or 1
+        amp = request.amp or 'bf16'
+        try:
+            logger.info(f"Loading target model from {model_path} with batch_size={batch_size}, tp_degree={tp_degree}")
+            neuron_config = NeuronConfig(
+                padding_side="right",
+                attention_layout="BSH",
+                collectives_layout="BSH",
+                on_device_embedding=True,
+                on_device_generation=GenerationConfig(do_sample=True)
+            )
+            self.model = NeuronAutoModelForCausalLM.from_pretrained(
+                model_path,
+                batch_size=batch_size,
+                n_positions=n_positions,
+                tp_degree=tp_degree,
+                amp=amp,
+                neuron_config=neuron_config
+            )
+            compile_start = time.time()
+            self.model.to_neuron()  # Compile model on Neuron cores
+            compile_time = time.time() - compile_start
+            logger.info(f"Target model compiled and loaded in {compile_time:.2f} seconds.")
+        except Exception as e:
+            logger.error(f"Failed to load target model: {e}")
+            return inference_pb2.LoadModelResponse(success=False, message=str(e))
+        # Save generation config (top_k, top_p, etc.), assume defaults or parse if extended
+        self.generation_config = {
+            "top_k": 50,
+            "top_p": 0.9,
+            "temperature": 1.0,
+            "do_sample": True
+        }
+        return inference_pb2.LoadModelResponse(success=True, message="Target model loaded successfully")
 
-    def get_active_indices(self):
-        return [i for i, fin in enumerate(self.finished_mask) if not fin]
+    def StartSession(self, request, context):
+        """Initialize a target model decoding session with a prompt."""
+        session_id = request.session_id or f"target-{len(self.sessions)+1}"
+        input_ids = list(request.input_ids)
+        if self.model is None:
+            return inference_pb2.StartSessionResponse(session_id=session_id, success=False,
+                                                        message="Model not loaded")
+        try:
+            input_tensor = torch.tensor([input_ids], dtype=torch.int64)
+            attention_mask = torch.ones_like(input_tensor)
+            outputs = self.model(input_ids=input_tensor, attention_mask=attention_mask, use_cache=True)
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits
+            last_logits = logits[0, -1, :]
+            # Store session state
+            self.sessions[session_id] = {
+                "past": past_key_values,
+                "last_logits": last_logits
+            }
+            logger.info(f"Target session {session_id} initialized (prompt length = {len(input_ids)} tokens).")
+            return inference_pb2.StartSessionResponse(session_id=session_id, success=True, message="Session started")
+        except Exception as e:
+            logger.error(f"Error in StartSession for target model: {e}")
+            return inference_pb2.StartSessionResponse(session_id=session_id, success=False, message=str(e))
 
-    def mark_finished(self, row_idx):
-        self.finished_mask[row_idx] = True
-
-    def expand_columns_if_needed(self, new_cols):
-        """
-        Expand self.current_ids to have new_cols columns if new_cols > self.seq_len.
-        """
-        if new_cols <= self.seq_len:
-            return
-        old_cols = self.seq_len
-        new_tensor = torch.full(
-            (self.batch_size, new_cols), self.pad_id, dtype=self.current_ids.dtype, device=self.current_ids.device
-        )
-        if old_cols>0:
-            new_tensor[:, :old_cols] = self.current_ids
-        self.current_ids = new_tensor
-        self.seq_len = new_cols
-
-    def add_tokens_to_row(self, row_idx, tokens: list):
-        """
-        Appends these tokens to row_idx, expanding columns if needed.
-        """
-        old_len = self.row_lengths[row_idx]
-        needed = old_len + len(tokens)
-        if needed > self.seq_len:
-            self.expand_columns_if_needed(needed)
-        # write them
-        for i, t in enumerate(tokens):
-            self.current_ids[row_idx, old_len + i] = t
-        self.row_lengths[row_idx]+= len(tokens)
-
-
-class SpeculativeServiceServicer(inference_pb2_grpc.SpeculativeServiceServicer):
-    def __init__(self, model_path, sequence_length=128, batch_size=2):
-        self.model = model_loader.load_model(model_path, sequence_length=sequence_length)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-        self.eos_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 2
-        self.sessions = {}  # session_id -> BatchedTargetSession
-        self.lock = torch.multiprocessing.Lock()
-        self.batch_size = batch_size
-        logger.info(f"Target worker compiled with batch_size={self.batch_size}.")
-
-    def _assign_next_row(self, sess: BatchedTargetSession):
-        """
-        Return index of a free row (not finished, length=0) or a row that is not used yet.
-        If no free row, return None.
-        """
-        for i in range(sess.batch_size):
-            if sess.row_lengths[i] == 0 and not sess.finished_mask[i]:
-                return i
-        return None
-
-    def _find_unfinished_row(self, sess: BatchedTargetSession):
-        """Return the first row that is not finished (the code uses 1 row per finalize)."""
-        for i in range(sess.batch_size):
-            if not sess.finished_mask[i]:
-                return i
-        return None
-
-    def StartGeneration(self, request, context):
+    def CheckTokenProbability(self, request, context):
+        """Get the target model probability of a given token at the current context."""
         session_id = request.session_id
-        prompt_text = request.prompt
-        max_tokens = request.max_new_tokens
-        gamma = request.gamma
-        logger.info(f"[session={session_id}] StartGeneration: prompt='{prompt_text}', max_new_tokens={max_tokens}, gamma={gamma}")
-        with self.lock:
-            if session_id in self.sessions:
-                logger.warning(f"Session {session_id} already exists, re-initializing.")
-            # Create an empty [batch_size,0] session
-            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-            sess = BatchedTargetSession(batch_size=self.batch_size, initial_seq_len=0, pad_token_id=pad_id)
-            self.sessions[session_id] = sess
-        return inference_pb2.StartResponse(acknowledged=True)
+        token_id = request.token_id
+        draft_prob = request.draft_prob
+        state = self.sessions.get(session_id)
+        if state is None:
+            return inference_pb2.CheckTokenResponse(target_prob=0.0)
+        # We assume the target model's last_logits contains the distribution for the next token at this context
+        logits = state["last_logits"]
+        # Apply same temperature as used in generation config (for consistency if temperature != 1)
+        temp = 1.0
+        if self.generation_config:
+            temp = self.generation_config.get("temperature", 1.0)
+        if temp != 1.0:
+            logits = logits / temp
+        # Compute softmax normalization factor (log-sum-exp for stability)
+        # We need the probability of token_id under the target distribution
+        # For numerical stability, subtract max logit
+        logits_np = logits.cpu().numpy()
+        max_logit = float(logits_np.max())
+        exp_logits = torch.exp(logits - max_logit)
+        exp_sum = float(exp_logits.sum().item())
+        token_exp = float(exp_logits[token_id].item())
+        target_prob = token_exp / exp_sum
+        # Alternatively, we could compute directly via softmax and index:
+        # target_prob = float(torch.nn.functional.softmax(logits, dim=-1)[token_id].item())
+        return inference_pb2.CheckTokenResponse(target_prob=target_prob)
 
-    def VerifyBatchTokens(self, request, context):
-        """
-        True single-pass partial acceptance. We do exactly one forward pass for the chunk of gamma tokens
-        each row proposes, shape [num_rows, old_len + chunk_len].
-        We re-encode from scratch here (no caching), but each chunk is only one pass.
-        If accepted_count=0 and mismatch=0, we forcibly mismatch the first token => ensures progress.
-        """
-        import torch
-        results = []
-        with self.lock:
-            seq_map = {}
-            for draft_seq in request.sequences:
-                sid = draft_seq.session_id
-                if sid not in seq_map:
-                    seq_map[sid] = []
-                seq_map[sid].append(draft_seq.draft_tokens)
+    def AppendToken(self, request, context):
+        """Append an accepted token to the target context (advance the target model state by one token)."""
+        session_id = request.session_id
+        token_id = request.token_id
+        state = self.sessions.get(session_id)
+        if state is None:
+            return inference_pb2.AppendTokenResponse(success=False)
+        try:
+            input_tensor = torch.tensor([[token_id]], dtype=torch.int64)
+            attention_mask = torch.ones_like(input_tensor)
+            out = self.model(input_ids=input_tensor, attention_mask=attention_mask,
+                             past_key_values=state["past"], use_cache=True)
+            # Update session state: new past and last_logits (distribution after this token)
+            state["past"] = out.past_key_values
+            state["last_logits"] = out.logits[0, -1, :]
+            return inference_pb2.AppendTokenResponse(success=True)
+        except Exception as e:
+            logger.error(f"AppendToken error for session {session_id}: {e}")
+            return inference_pb2.AppendTokenResponse(success=False)
 
-            for sid, token_lists in seq_map.items():
-                if sid not in self.sessions:
-                    # session not found => finish
-                    for tok_list in token_lists:
-                        results.append(inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=True
-                        ))
-                    continue
-                sess = self.sessions[sid]
-                device_ = next(self.model.parameters(), None)
-                if device_ is not None:
-                    device_ = device_.device
-                else:
-                    device_ = torch.device('cpu')
+    def GenerateTargetToken(self, request, context):
+        """Generate the next token from the target model's current distribution.
+           If draft_distribution is provided, perform distribution adjustment (rollback case)."""
+        session_id = request.session_id
+        state = self.sessions.get(session_id)
+        if state is None:
+            return inference_pb2.GenerateTargetResponse(token_id=0)
+        logits = state["last_logits"]
+        # Apply temperature if any
+        temp = 1.0
+        if self.generation_config:
+            temp = self.generation_config.get("temperature", 1.0)
+        if temp != 1.0:
+            logits = logits / temp
+        # Compute target probabilities
+        target_probs = torch.nn.functional.softmax(logits, dim=-1)
+        if len(request.draft_distribution) > 0:
+            # Draft distribution provided: subtract it from target distribution (p - q)
+            # Construct tensor for draft distribution
+            q = torch.tensor(request.draft_distribution, dtype=torch.float32)
+            # Align length (should be full vocab)
+            if q.shape != target_probs.shape:
+                # If shapes differ (perhaps due to different vocab?), pad or truncate as needed
+                min_len = min(q.shape[0], target_probs.shape[0])
+                q = q[:min_len]
+                q = torch.nn.functional.pad(q, (0, target_probs.shape[0] - min_len))
+            p = target_probs
+            adjusted = p - q
+            # Clip negatives to zero
+            adjusted = torch.clamp(adjusted, min=0.0)
+            # If all values are zero (unlikely unless q > p on all), fallback to p
+            if torch.sum(adjusted) <= 0:
+                adjusted = p
+            # Renormalize to sum to 1
+            adjusted = adjusted / torch.sum(adjusted)
+            # Sample token from adjusted distribution
+            if self.generation_config and not self.generation_config.get("do_sample", True):
+                next_token_id = int(torch.argmax(adjusted))
+            else:
+                next_token_id = int(torch.multinomial(adjusted, 1))
+            next_token_prob = float(adjusted[next_token_id].item())
+            logger.info(f"Target model adjusted distribution sampling: token={next_token_id}, prob={next_token_prob:.4f}")
+        else:
+            # No draft distribution, just sample from target's own distribution
+            p = target_probs
+            if self.generation_config and not self.generation_config.get("do_sample", True):
+                next_token_id = int(torch.argmax(p))
+            else:
+                # Apply top-p/top-k filtering to target distribution as well (to mirror sampling constraints)
+                probs = p.clone()
+                top_p = self.generation_config.get("top_p", 1.0) if self.generation_config else 1.0
+                top_k = self.generation_config.get("top_k", 0) if self.generation_config else 0
+                if top_p < 1.0:
+                    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                    cum_probs = torch.cumsum(sorted_probs, dim=0)
+                    cutoff_index = torch.searchsorted(cum_probs, top_p)
+                    cutoff_index = min(int(cutoff_index), sorted_probs.shape[0]-1)
+                    cutoff_prob = sorted_probs[cutoff_index]
+                    probs[probs < cutoff_prob] = 0.0
+                    probs = probs / probs.sum()
+                if top_k > 0:
+                    if top_k < probs.numel():
+                        threshold_prob = torch.topk(probs, top_k)[0][-1]
+                        probs[probs < threshold_prob] = 0.0
+                        probs = probs / probs.sum()
+                next_token_id = int(torch.multinomial(probs, 1))
+            # (We could log target's chosen token probability if needed)
+        # Append this token to the target model's context (advance one step)
+        input_tensor = torch.tensor([[next_token_id]], dtype=torch.int64)
+        attention_mask = torch.ones_like(input_tensor)
+        out = self.model(input_ids=input_tensor, attention_mask=attention_mask,
+                         past_key_values=state["past"], use_cache=True)
+        state["past"] = out.past_key_values
+        state["last_logits"] = out.logits[0, -1, :]
+        return inference_pb2.GenerateTargetResponse(token_id=next_token_id)
 
-                # For demonstration, we handle each row in token_lists sequentially. If you want multi-row,
-                # unify them in one pass. We'll do a single row approach for clarity.
-                for d_toks in token_lists:
-                    # find a row
-                    r_idx = self._find_unfinished_row(sess)
-                    if r_idx is None:
-                        results.append(inference_pb2.VerifyResult(
-                            session_id=sid, tokens_accepted=0, target_token=0, finished=True
-                        ))
-                        continue
-
-                    if not d_toks:
-                        # no tokens => skip
-                        results.append(inference_pb2.VerifyResult(
-                            session_id=sid,
-                            tokens_accepted=0,
-                            target_token=0,
-                            finished=sess.finished_mask[r_idx]
-                        ))
-                        continue
-
-                    old_len = sess.row_lengths[r_idx]
-                    old_ids = sess.current_ids[r_idx, :old_len]
-                    chunk_len = len(d_toks)
-                    # build new context
-                    new_row = torch.cat([old_ids, torch.tensor(d_toks, dtype=old_ids.dtype)], dim=0)
-                    new_len = new_row.size(0)
-
-                    # single pass => shape [1, new_len, vocab]
-                    with torch.no_grad():
-                        out = self.model(new_row.unsqueeze(0).to(device_))
-                    if hasattr(out, 'logits'):
-                        logits_3d = out.logits
-                    else:
-                        logits_3d = out
-                    if logits_3d.dim()==2:
-                        logits_3d = logits_3d.unsqueeze(1)  # => [1, new_len, vocab]
-
-                    # partial acceptance
-                    accepted_count=0
-                    mismatch_tok=0
-                    fin=False
-                    row_logits_slice = logits_3d[0, (new_len - chunk_len):, :] # the last chunk_len positions
-                    for i_token in range(chunk_len):
-                        dtok = d_toks[i_token]
-                        row_logits = row_logits_slice[i_token, :]
-                        t_id = int(torch.argmax(row_logits).item())
-                        if t_id == dtok:
-                            accepted_count+=1
-                            if t_id == self.eos_token_id:
-                                fin=True
-                                sess.finished_mask[r_idx]=True
-                                break
-                        else:
-                            mismatch_tok = t_id
-                            if mismatch_tok==self.eos_token_id:
-                                fin=True
-                                sess.finished_mask[r_idx]=True
-                            break
-                    # failsafe mismatch if accepted=0 & mismatch=0 => force mismatch
-                    if accepted_count==0 and mismatch_tok==0 and chunk_len>0:
-                        mismatch_tok = (d_toks[0]+1) % row_logits_slice.shape[1]
-
-                    # finalize in session => store accepted tokens + forced mismatch
-                    accepted_tokens = d_toks[:accepted_count]
-                    sess.add_tokens_to_row(r_idx, accepted_tokens)
-                    if mismatch_tok!=0:
-                        sess.add_tokens_to_row(r_idx, [mismatch_tok])
-                        if mismatch_tok == self.eos_token_id:
-                            fin=True
-                            sess.finished_mask[r_idx]=True
-
-                    res = inference_pb2.VerifyResult(
-                        session_id=sid,
-                        tokens_accepted=accepted_count,
-                        target_token=mismatch_tok,
-                        finished=fin
-                    )
-                    results.append(res)
-
-        return inference_pb2.VerifyBatchResponse(results=results)
-
-
-
-    def FinalizeBatchTokens(self, request, context):
-        """
-        For each sequence, store the given tokens into the next available row or the first unfinished row.
-        If we see EOS, we mark that row as finished.
-        """
-        results = []
-        with self.lock:
-            sid_to_tokens = {}
-            for seq in request.sequences:
-                sid = seq.session_id
-                if sid not in sid_to_tokens:
-                    sid_to_tokens[sid] = []
-                sid_to_tokens[sid].append(seq.tokens)
-
-            for sid, list_of_token_lists in sid_to_tokens.items():
-                if sid not in self.sessions:
-                    logger.warning(f"Session {sid} not found in finalize batch.")
-                    for tok_list in list_of_token_lists:
-                        results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=True))
-                    continue
-                sess = self.sessions[sid]
-                for tok_list in list_of_token_lists:
-                    row_idx = self._find_unfinished_row(sess)
-                    if row_idx is None:
-                        # all done
-                        results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=True))
-                        continue
-                    # store tokens
-                    sess.add_tokens_to_row(row_idx, tok_list)
-                    # check if eos in tok_list
-                    if self.eos_token_id in tok_list:
-                        sess.mark_finished(row_idx)
-                    fin = sess.finished_mask[row_idx]
-                    results.append(inference_pb2.FinalizeBatchResult(session_id=sid, finished=fin))
-
-        return inference_pb2.FinalizeBatchResponse(results=results)
-
-    # Single-sequence calls (legacy)
-    def VerifyDraftTokens(self, request, context):
-        sid = request.session_id
-        draft_tokens = list(request.draft_tokens)
-        logger.info(f"[session={sid}] VerifyDraftTokens: {draft_tokens}")
-        # fallback single-sequence
-        return inference_pb2.VerifyResponse(target_probs=[1.0]*len(draft_tokens), finished=False)
-
-    def FinalizeTokens(self, request, context):
-        sid = request.session_id
-        accepted_count = request.accepted_count
-        draft_chunk_size = request.draft_chunk_size
-        logger.info(f"[session={sid}] FinalizeTokens: accepted_count={accepted_count}, chunk_size={draft_chunk_size}")
-        # fallback single-sequence
-        return inference_pb2.FinalizeResponse(final_token=0, finished=False)
-
-def run_server(model_path, port=50051, sequence_length=128, profile=False):
-    logging.basicConfig(level=logging.INFO)
-    logger.info(f"Loading target model from {model_path} seq_len={sequence_length}")
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
-    servicer = SpeculativeServiceServicer(model_path, sequence_length=sequence_length, batch_size=2)
-    inference_pb2_grpc.add_SpeculativeServiceServicer_to_server(servicer, server)
-    server_address = f"[::]:{port}"
-    logger.info(f"Target server starting on {server_address}")
-    server.add_insecure_port(server_address)
+def serve(port=50052):
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    inference_pb2_grpc.add_TargetServiceServicer_to_server(TargetServicer(), server)
+    server.add_insecure_port(f"[::]:{port}")
+    logger.info(f"Starting TargetService gRPC server on port {port}...")
     server.start()
     server.wait_for_termination()
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Target model gRPC worker")
+    parser.add_argument("--port", type=int, default=50052, help="Port to run the TargetService server on")
+    args = parser.parse_args()
+    serve(port=args.port)

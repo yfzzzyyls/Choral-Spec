@@ -25,8 +25,8 @@ if _version_not_supported:
     )
 
 
-class SpeculativeServiceStub(object):
-    """Speculative Decoding gRPC Service definition
+class DraftServiceStub(object):
+    """Service for draft (small) model operations
     """
 
     def __init__(self, channel):
@@ -35,161 +35,97 @@ class SpeculativeServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.StartGeneration = channel.unary_unary(
-                '/specdecode.SpeculativeService/StartGeneration',
-                request_serializer=inference__pb2.StartRequest.SerializeToString,
-                response_deserializer=inference__pb2.StartResponse.FromString,
+        self.LoadModel = channel.unary_unary(
+                '/speculative.DraftService/LoadModel',
+                request_serializer=inference__pb2.LoadModelRequest.SerializeToString,
+                response_deserializer=inference__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
-        self.VerifyBatchTokens = channel.unary_unary(
-                '/specdecode.SpeculativeService/VerifyBatchTokens',
-                request_serializer=inference__pb2.VerifyBatchRequest.SerializeToString,
-                response_deserializer=inference__pb2.VerifyBatchResponse.FromString,
+        self.StartSession = channel.unary_unary(
+                '/speculative.DraftService/StartSession',
+                request_serializer=inference__pb2.StartSessionRequest.SerializeToString,
+                response_deserializer=inference__pb2.StartSessionResponse.FromString,
                 _registered_method=True)
-        self.FinalizeBatchTokens = channel.unary_unary(
-                '/specdecode.SpeculativeService/FinalizeBatchTokens',
-                request_serializer=inference__pb2.FinalizeBatchRequest.SerializeToString,
-                response_deserializer=inference__pb2.FinalizeBatchResponse.FromString,
+        self.GenerateDraft = channel.unary_unary(
+                '/speculative.DraftService/GenerateDraft',
+                request_serializer=inference__pb2.GenerateDraftRequest.SerializeToString,
+                response_deserializer=inference__pb2.GenerateDraftResponse.FromString,
                 _registered_method=True)
-        self.VerifyDraftTokens = channel.unary_unary(
-                '/specdecode.SpeculativeService/VerifyDraftTokens',
-                request_serializer=inference__pb2.VerifyRequest.SerializeToString,
-                response_deserializer=inference__pb2.VerifyResponse.FromString,
-                _registered_method=True)
-        self.FinalizeTokens = channel.unary_unary(
-                '/specdecode.SpeculativeService/FinalizeTokens',
-                request_serializer=inference__pb2.FinalizeRequest.SerializeToString,
-                response_deserializer=inference__pb2.FinalizeResponse.FromString,
-                _registered_method=True)
-        self.VerifyBatchTokens2D = channel.unary_unary(
-                '/specdecode.SpeculativeService/VerifyBatchTokens2D',
-                request_serializer=inference__pb2.VerifyBatch2DRequest.SerializeToString,
-                response_deserializer=inference__pb2.VerifyBatch2DResponse.FromString,
-                _registered_method=True)
-        self.FinalizeBatchTokens2D = channel.unary_unary(
-                '/specdecode.SpeculativeService/FinalizeBatchTokens2D',
-                request_serializer=inference__pb2.FinalizeBatch2DRequest.SerializeToString,
-                response_deserializer=inference__pb2.FinalizeBatch2DResponse.FromString,
-                _registered_method=True)
-        self.GenerateFull = channel.unary_unary(
-                '/specdecode.SpeculativeService/GenerateFull',
-                request_serializer=inference__pb2.StartRequest.SerializeToString,
-                response_deserializer=inference__pb2.GenerateResponse.FromString,
+        self.UpdateDraftContext = channel.unary_unary(
+                '/speculative.DraftService/UpdateDraftContext',
+                request_serializer=inference__pb2.UpdateDraftContextRequest.SerializeToString,
+                response_deserializer=inference__pb2.UpdateDraftContextResponse.FromString,
                 _registered_method=True)
 
 
-class SpeculativeServiceServicer(object):
-    """Speculative Decoding gRPC Service definition
+class DraftServiceServicer(object):
+    """Service for draft (small) model operations
     """
 
-    def StartGeneration(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def VerifyBatchTokens(self, request, context):
-        """BATCH calls (legacy single-row)
+    def LoadModel(self, request, context):
+        """Load the draft model (e.g., Meta LLaMA small model) on the server
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def FinalizeBatchTokens(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def VerifyDraftTokens(self, request, context):
-        """Single-sequence calls (legacy)
+    def StartSession(self, request, context):
+        """Start a new decoding session with a given prompt (context)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def FinalizeTokens(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def VerifyBatchTokens2D(self, request, context):
-        """2D BATCH calls (new)
+    def GenerateDraft(self, request, context):
+        """Generate a speculative draft of tokens from the draft model
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def FinalizeBatchTokens2D(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GenerateFull(self, request, context):
-        """Optional full generation for baseline
+    def UpdateDraftContext(self, request, context):
+        """Update the draft model context after speculative decoding (rollback and new token integration)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_SpeculativeServiceServicer_to_server(servicer, server):
+def add_DraftServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'StartGeneration': grpc.unary_unary_rpc_method_handler(
-                    servicer.StartGeneration,
-                    request_deserializer=inference__pb2.StartRequest.FromString,
-                    response_serializer=inference__pb2.StartResponse.SerializeToString,
+            'LoadModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.LoadModel,
+                    request_deserializer=inference__pb2.LoadModelRequest.FromString,
+                    response_serializer=inference__pb2.LoadModelResponse.SerializeToString,
             ),
-            'VerifyBatchTokens': grpc.unary_unary_rpc_method_handler(
-                    servicer.VerifyBatchTokens,
-                    request_deserializer=inference__pb2.VerifyBatchRequest.FromString,
-                    response_serializer=inference__pb2.VerifyBatchResponse.SerializeToString,
+            'StartSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartSession,
+                    request_deserializer=inference__pb2.StartSessionRequest.FromString,
+                    response_serializer=inference__pb2.StartSessionResponse.SerializeToString,
             ),
-            'FinalizeBatchTokens': grpc.unary_unary_rpc_method_handler(
-                    servicer.FinalizeBatchTokens,
-                    request_deserializer=inference__pb2.FinalizeBatchRequest.FromString,
-                    response_serializer=inference__pb2.FinalizeBatchResponse.SerializeToString,
+            'GenerateDraft': grpc.unary_unary_rpc_method_handler(
+                    servicer.GenerateDraft,
+                    request_deserializer=inference__pb2.GenerateDraftRequest.FromString,
+                    response_serializer=inference__pb2.GenerateDraftResponse.SerializeToString,
             ),
-            'VerifyDraftTokens': grpc.unary_unary_rpc_method_handler(
-                    servicer.VerifyDraftTokens,
-                    request_deserializer=inference__pb2.VerifyRequest.FromString,
-                    response_serializer=inference__pb2.VerifyResponse.SerializeToString,
-            ),
-            'FinalizeTokens': grpc.unary_unary_rpc_method_handler(
-                    servicer.FinalizeTokens,
-                    request_deserializer=inference__pb2.FinalizeRequest.FromString,
-                    response_serializer=inference__pb2.FinalizeResponse.SerializeToString,
-            ),
-            'VerifyBatchTokens2D': grpc.unary_unary_rpc_method_handler(
-                    servicer.VerifyBatchTokens2D,
-                    request_deserializer=inference__pb2.VerifyBatch2DRequest.FromString,
-                    response_serializer=inference__pb2.VerifyBatch2DResponse.SerializeToString,
-            ),
-            'FinalizeBatchTokens2D': grpc.unary_unary_rpc_method_handler(
-                    servicer.FinalizeBatchTokens2D,
-                    request_deserializer=inference__pb2.FinalizeBatch2DRequest.FromString,
-                    response_serializer=inference__pb2.FinalizeBatch2DResponse.SerializeToString,
-            ),
-            'GenerateFull': grpc.unary_unary_rpc_method_handler(
-                    servicer.GenerateFull,
-                    request_deserializer=inference__pb2.StartRequest.FromString,
-                    response_serializer=inference__pb2.GenerateResponse.SerializeToString,
+            'UpdateDraftContext': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateDraftContext,
+                    request_deserializer=inference__pb2.UpdateDraftContextRequest.FromString,
+                    response_serializer=inference__pb2.UpdateDraftContextResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'specdecode.SpeculativeService', rpc_method_handlers)
+            'speculative.DraftService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('specdecode.SpeculativeService', rpc_method_handlers)
+    server.add_registered_method_handlers('speculative.DraftService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class SpeculativeService(object):
-    """Speculative Decoding gRPC Service definition
+class DraftService(object):
+    """Service for draft (small) model operations
     """
 
     @staticmethod
-    def StartGeneration(request,
+    def LoadModel(request,
             target,
             options=(),
             channel_credentials=None,
@@ -202,9 +138,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/StartGeneration',
-            inference__pb2.StartRequest.SerializeToString,
-            inference__pb2.StartResponse.FromString,
+            '/speculative.DraftService/LoadModel',
+            inference__pb2.LoadModelRequest.SerializeToString,
+            inference__pb2.LoadModelResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -216,7 +152,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def VerifyBatchTokens(request,
+    def StartSession(request,
             target,
             options=(),
             channel_credentials=None,
@@ -229,9 +165,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/VerifyBatchTokens',
-            inference__pb2.VerifyBatchRequest.SerializeToString,
-            inference__pb2.VerifyBatchResponse.FromString,
+            '/speculative.DraftService/StartSession',
+            inference__pb2.StartSessionRequest.SerializeToString,
+            inference__pb2.StartSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -243,7 +179,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def FinalizeBatchTokens(request,
+    def GenerateDraft(request,
             target,
             options=(),
             channel_credentials=None,
@@ -256,9 +192,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/FinalizeBatchTokens',
-            inference__pb2.FinalizeBatchRequest.SerializeToString,
-            inference__pb2.FinalizeBatchResponse.FromString,
+            '/speculative.DraftService/GenerateDraft',
+            inference__pb2.GenerateDraftRequest.SerializeToString,
+            inference__pb2.GenerateDraftResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -270,7 +206,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def VerifyDraftTokens(request,
+    def UpdateDraftContext(request,
             target,
             options=(),
             channel_credentials=None,
@@ -283,9 +219,153 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/VerifyDraftTokens',
-            inference__pb2.VerifyRequest.SerializeToString,
-            inference__pb2.VerifyResponse.FromString,
+            '/speculative.DraftService/UpdateDraftContext',
+            inference__pb2.UpdateDraftContextRequest.SerializeToString,
+            inference__pb2.UpdateDraftContextResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class TargetServiceStub(object):
+    """Service for target (large) model operations
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.LoadModel = channel.unary_unary(
+                '/speculative.TargetService/LoadModel',
+                request_serializer=inference__pb2.LoadModelRequest.SerializeToString,
+                response_deserializer=inference__pb2.LoadModelResponse.FromString,
+                _registered_method=True)
+        self.StartSession = channel.unary_unary(
+                '/speculative.TargetService/StartSession',
+                request_serializer=inference__pb2.StartSessionRequest.SerializeToString,
+                response_deserializer=inference__pb2.StartSessionResponse.FromString,
+                _registered_method=True)
+        self.CheckTokenProbability = channel.unary_unary(
+                '/speculative.TargetService/CheckTokenProbability',
+                request_serializer=inference__pb2.CheckTokenRequest.SerializeToString,
+                response_deserializer=inference__pb2.CheckTokenResponse.FromString,
+                _registered_method=True)
+        self.AppendToken = channel.unary_unary(
+                '/speculative.TargetService/AppendToken',
+                request_serializer=inference__pb2.AppendTokenRequest.SerializeToString,
+                response_deserializer=inference__pb2.AppendTokenResponse.FromString,
+                _registered_method=True)
+        self.GenerateTargetToken = channel.unary_unary(
+                '/speculative.TargetService/GenerateTargetToken',
+                request_serializer=inference__pb2.GenerateTargetRequest.SerializeToString,
+                response_deserializer=inference__pb2.GenerateTargetResponse.FromString,
+                _registered_method=True)
+
+
+class TargetServiceServicer(object):
+    """Service for target (large) model operations
+    """
+
+    def LoadModel(self, request, context):
+        """Load the target model (e.g., LLaMA large model) on the server
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StartSession(self, request, context):
+        """Start a new decoding session with a given prompt (context)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CheckTokenProbability(self, request, context):
+        """Check acceptance probability of a draft token with the target model
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AppendToken(self, request, context):
+        """Append an accepted token to the target context (updates KV cache and prepares next distribution)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GenerateTargetToken(self, request, context):
+        """Generate the next target token when draft tokens are exhausted or rejected (handles finalization)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_TargetServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'LoadModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.LoadModel,
+                    request_deserializer=inference__pb2.LoadModelRequest.FromString,
+                    response_serializer=inference__pb2.LoadModelResponse.SerializeToString,
+            ),
+            'StartSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.StartSession,
+                    request_deserializer=inference__pb2.StartSessionRequest.FromString,
+                    response_serializer=inference__pb2.StartSessionResponse.SerializeToString,
+            ),
+            'CheckTokenProbability': grpc.unary_unary_rpc_method_handler(
+                    servicer.CheckTokenProbability,
+                    request_deserializer=inference__pb2.CheckTokenRequest.FromString,
+                    response_serializer=inference__pb2.CheckTokenResponse.SerializeToString,
+            ),
+            'AppendToken': grpc.unary_unary_rpc_method_handler(
+                    servicer.AppendToken,
+                    request_deserializer=inference__pb2.AppendTokenRequest.FromString,
+                    response_serializer=inference__pb2.AppendTokenResponse.SerializeToString,
+            ),
+            'GenerateTargetToken': grpc.unary_unary_rpc_method_handler(
+                    servicer.GenerateTargetToken,
+                    request_deserializer=inference__pb2.GenerateTargetRequest.FromString,
+                    response_serializer=inference__pb2.GenerateTargetResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'speculative.TargetService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('speculative.TargetService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class TargetService(object):
+    """Service for target (large) model operations
+    """
+
+    @staticmethod
+    def LoadModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/speculative.TargetService/LoadModel',
+            inference__pb2.LoadModelRequest.SerializeToString,
+            inference__pb2.LoadModelResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -297,7 +377,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def FinalizeTokens(request,
+    def StartSession(request,
             target,
             options=(),
             channel_credentials=None,
@@ -310,9 +390,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/FinalizeTokens',
-            inference__pb2.FinalizeRequest.SerializeToString,
-            inference__pb2.FinalizeResponse.FromString,
+            '/speculative.TargetService/StartSession',
+            inference__pb2.StartSessionRequest.SerializeToString,
+            inference__pb2.StartSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -324,7 +404,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def VerifyBatchTokens2D(request,
+    def CheckTokenProbability(request,
             target,
             options=(),
             channel_credentials=None,
@@ -337,9 +417,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/VerifyBatchTokens2D',
-            inference__pb2.VerifyBatch2DRequest.SerializeToString,
-            inference__pb2.VerifyBatch2DResponse.FromString,
+            '/speculative.TargetService/CheckTokenProbability',
+            inference__pb2.CheckTokenRequest.SerializeToString,
+            inference__pb2.CheckTokenResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -351,7 +431,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def FinalizeBatchTokens2D(request,
+    def AppendToken(request,
             target,
             options=(),
             channel_credentials=None,
@@ -364,9 +444,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/FinalizeBatchTokens2D',
-            inference__pb2.FinalizeBatch2DRequest.SerializeToString,
-            inference__pb2.FinalizeBatch2DResponse.FromString,
+            '/speculative.TargetService/AppendToken',
+            inference__pb2.AppendTokenRequest.SerializeToString,
+            inference__pb2.AppendTokenResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -378,7 +458,7 @@ class SpeculativeService(object):
             _registered_method=True)
 
     @staticmethod
-    def GenerateFull(request,
+    def GenerateTargetToken(request,
             target,
             options=(),
             channel_credentials=None,
@@ -391,9 +471,9 @@ class SpeculativeService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/specdecode.SpeculativeService/GenerateFull',
-            inference__pb2.StartRequest.SerializeToString,
-            inference__pb2.GenerateResponse.FromString,
+            '/speculative.TargetService/GenerateTargetToken',
+            inference__pb2.GenerateTargetRequest.SerializeToString,
+            inference__pb2.GenerateTargetResponse.FromString,
             options,
             channel_credentials,
             insecure,
