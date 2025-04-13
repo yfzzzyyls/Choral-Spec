@@ -8,11 +8,16 @@ from transformers_neuronx import NeuronAutoModelForCausalLM, NeuronConfig, Gener
 from grpc_comm import inference_pb2
 from grpc_comm import inference_pb2_grpc
 
-logging.basicConfig(level=logging.INFO)
+##############################################
+# Set up logger at DEBUG level
+##############################################
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("DraftWorker")
+logger.setLevel(logging.DEBUG)
 
 class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
     def __init__(self):
+        logger.info("[DraftServicer.__init__] Constructing the DraftServicer now.")
         self.model = None
         self.generation_config = {}
         self.sessions = {}  # session_id -> dict(past, last_logits, state_cache_stack)
@@ -24,7 +29,7 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
         tp_degree = request.tp_degree or 1
         amp = request.amp or 'bf16'
         try:
-            logger.info(f"[Draft] Loading model={model_path}, n_positions={n_positions}, batch_size={batch_size}, tp_degree={tp_degree}, amp={amp}")
+            logger.info(f"[Draft] LoadModel called: model={model_path}, n_positions={n_positions}, batch_size={batch_size}, tp_degree={tp_degree}, amp={amp}")
             neuron_cfg = NeuronConfig(
                 padding_side="right",
                 attention_layout="BSH",
@@ -46,7 +51,7 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
             logger.info(f"[Draft] Model compiled in {compile_time:.2f}s.")
             return inference_pb2.LoadModelResponse(success=True, message="Draft model loaded.")
         except Exception as e:
-            logger.error(f"[Draft] LoadModel error: {e}")
+            logger.error(f"[Draft] LoadModel error: {e}", exc_info=True)
             return inference_pb2.LoadModelResponse(success=False, message=str(e))
 
     def StartSession(self, request, context):
@@ -55,6 +60,7 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
             sid=f"draft-{len(self.sessions)+1}"
         input_ids = list(request.input_ids)
         if self.model is None:
+            logger.error("[Draft] StartSession: model not loaded yet.")
             return inference_pb2.StartSessionResponse(
                 session_id=sid, success=False, message="Draft model not loaded."
             )
@@ -73,7 +79,7 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
             logger.info(f"[Draft] StartSession sid={sid}, prompt len={len(input_ids)}")
             return inference_pb2.StartSessionResponse(session_id=sid, success=True, message="Draft session started.")
         except Exception as e:
-            logger.error(f"[Draft] StartSession error: {e}")
+            logger.error(f"[Draft] StartSession error: {e}", exc_info=True)
             return inference_pb2.StartSessionResponse(session_id=sid, success=False, message=str(e))
 
     def GenerateDraft(self, request, context):
@@ -124,12 +130,11 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                 for i in range(1, draft_len+1):
                     # sample from curr_logits
                     logits=curr_logits
-                    # (Apply a fixed top_p=0.9, temperature=1.0, or read from self.generation_config)
+                    # apply temperature, top_p=0.9 as a demo
                     temp = self.generation_config.get("temperature", 1.0) if self.generation_config else 1.0
                     if temp!=1.0:
                         logits=logits/temp
                     p = torch.nn.functional.softmax(logits, dim=-1)
-                    # top_p=0.9
                     top_p = self.generation_config.get("top_p", 0.9) if self.generation_config else 0.9
                     if top_p<1.0:
                         sorted_p,sorted_idx=torch.sort(p,descending=True)
@@ -140,20 +145,19 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                         else:
                             ci=len(sorted_p)-1
                         keep_idx=sorted_idx[:ci+1]
-                        mask=torch.zeros_like(p, dtype=torch.bool)
+                        mask=torch.zeros_like(p,dtype=torch.bool)
                         mask[keep_idx]=True
                         p=p*mask
                         p=p/p.sum()
-                    # sample
                     next_id=int(torch.multinomial(p,1).item())
                     next_prob=float(p[next_id])
                     tokens.append(next_id)
                     probs.append(next_prob)
                     if i<draft_len:
-                        # feed next_id
                         inpt=torch.tensor([[next_id]],dtype=torch.int64)
                         attn=torch.ones_like(inpt)
-                        out=self.model(input_ids=inpt, attention_mask=attn, past_key_values=curr_past, use_cache=True)
+                        out=self.model(input_ids=inpt, attention_mask=attn,
+                                       past_key_values=curr_past, use_cache=True)
                         curr_past=out.past_key_values
                         curr_logits=out.logits[0,-1,:]
                         # store snapshot
@@ -163,8 +167,7 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                             cpy_past=None
                         cpy_logits=curr_logits.clone()
                         state["state_cache_stack"][i]=(cpy_past, cpy_logits)
-                # done generating
-                # store final
+                # done
                 state["past"]=curr_past
                 state["last_logits"]=curr_logits
                 if curr_past is not None:
@@ -173,7 +176,6 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                     cpy_past=None
                 cpy_logits=curr_logits.clone() if curr_logits is not None else None
                 state["state_cache_stack"][draft_len]=(cpy_past, cpy_logits)
-
                 outputs.append(
                     inference_pb2.GenerateDraftResponse.DraftOutput(
                         session_id=sid,
@@ -183,8 +185,7 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                 )
                 logger.info(f"[Draft] generate sid={sid} => {tokens}")
             except Exception as e:
-                logger.error(f"GenerateDraft error on sid={sid}: {e}")
-                # Return partial if some tokens
+                logger.error(f"GenerateDraft error on sid={sid}: {e}", exc_info=True)
                 outputs.append(
                     inference_pb2.GenerateDraftResponse.DraftOutput(
                         session_id=sid,
@@ -195,18 +196,12 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
         return inference_pb2.GenerateDraftResponse(outputs=outputs)
 
     def UpdateDraftContext(self, request, context):
-        """
-        Rollback and/or integrate the next target token.
-        accepted_count => how many of the previously generated tokens we keep
-        new_token => the forced token from the target
-        """
         sid=request.session_id
         accept_count=request.accepted_count
         forced_tok=request.new_token
         if sid not in self.sessions:
             return inference_pb2.UpdateDraftContextResponse(success=False, message="No session found")
         st=self.sessions[sid]
-        # rollback
         scs=st["state_cache_stack"]
         if accept_count<len(scs):
             cpy=scs[accept_count]
@@ -214,7 +209,6 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                 st["past"], st["last_logits"]=cpy
             else:
                 logger.warning(f"[Draft] no stored snapshot for accept_count={accept_count}")
-        # if forced_tok != 0 => feed it into the model
         if forced_tok!=0:
             try:
                 inpt=torch.tensor([[forced_tok]],dtype=torch.int64)
@@ -224,25 +218,29 @@ class DraftServicer(inference_pb2_grpc.DraftServiceServicer):
                 st["past"]=out.past_key_values
                 st["last_logits"]=out.logits[0,-1,:]
             except Exception as e:
-                logger.error(f"[Draft] error appending forced token {forced_tok} in UpdateDraftContext: {e}")
+                logger.error(f"[Draft] error appending forced token {forced_tok} in UpdateDraftContext: {e}", exc_info=True)
                 return inference_pb2.UpdateDraftContextResponse(success=False, message=str(e))
-        # done
         st["state_cache_stack"]=[]
         return inference_pb2.UpdateDraftContextResponse(success=True, message="Updated draft context")
 
 def serve(port=50051):
+    logger.info(f"[DraftWorker] about to create gRPC server on port {port}")
     server=grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     inference_pb2_grpc.add_DraftServiceServicer_to_server(DraftServicer(), server)
     server.add_insecure_port(f"[::]:{port}")
-    logger.info(f"DraftWorker gRPC listening on port {port}")
+    logger.info(f"[DraftWorker] gRPC listening on port {port}")
     server.start()
+    logger.info("[DraftWorker] server.start() called, now waiting for termination.")
     server.wait_for_termination()
 
-# if __name__=="__main__":
+logger.info("[DraftWorker MAIN] This file is being run, not just imported.")
+logger.info("[DraftWorker] The script is actually running, about to parse args...")
+
 import argparse
-parser=argparse.ArgumentParser()
-parser.add_argument("--port",type=int,default=50051)
+parser=argparse.ArgumentParser(description="Draft model gRPC worker.")
+parser.add_argument("--port",type=int,default=50051,help="Port to run on.")
 args=parser.parse_args()
+
 logger.info(f"[DraftWorker MAIN] invoked with --port={args.port}")
 logger.info("[DraftWorker] The script is actually running, about to serve...")
 serve(port=args.port)
