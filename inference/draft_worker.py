@@ -238,9 +238,11 @@ def serve(port=50051):
     server.start()
     server.wait_for_termination()
 
-if __name__=="__main__":
-    import argparse
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--port",type=int,default=50051)
-    args=parser.parse_args()
-    serve(port=args.port)
+# if __name__=="__main__":
+import argparse
+parser=argparse.ArgumentParser()
+parser.add_argument("--port",type=int,default=50051)
+args=parser.parse_args()
+logger.info(f"[DraftWorker MAIN] invoked with --port={args.port}")
+logger.info("[DraftWorker] The script is actually running, about to serve...")
+serve(port=args.port)
