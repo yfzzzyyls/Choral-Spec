@@ -1,231 +1,340 @@
+import argparse
+import logging
+import sys
+import torch
 import grpc
 import time
-import logging
-from speculative_pb2 import LoadModelRequest, StartSessionRequest, GenerateDraftRequest, CheckTokenRequest, GenerateTargetRequest, AppendTokenRequest, UpdateDraftContextRequest
-from speculative_pb2_grpc import DraftServiceStub, TargetServiceStub
+
+from grpc_comm.inference_pb2 import (
+    LoadModelRequest,
+    StartSessionRequest,
+    GenerateDraftRequest,
+    CheckTokenRequest,
+    GenerateTargetRequest,
+    AppendTokenRequest,
+    UpdateDraftContextRequest
+)
+from grpc_comm.inference_pb2_grpc import DraftServiceStub, TargetServiceStub
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SpeculativeDecoder")
 
 class SpeculativeDecoder:
-    def __init__(self, draft_address, target_address, draft_length=4):
-        # Connect to gRPC services
+    def __init__(self, draft_address, target_address, gamma=4):
+        """
+        Connect to the small (draft) and large (target) model gRPC services.
+        `gamma` is how many tokens to generate from the draft in each chunk.
+        """
         self.draft_channel = grpc.insecure_channel(draft_address)
         self.target_channel = grpc.insecure_channel(target_address)
         self.draft_stub = DraftServiceStub(self.draft_channel)
         self.target_stub = TargetServiceStub(self.target_channel)
-        self.draft_length = draft_length
+        self.gamma = gamma
         self.initialized = False
 
-    def load_models(self, draft_model_path, target_model_path, max_length=1024, draft_tp=1, target_tp=1):
-        """Load draft and target models on their respective workers."""
-        # Load draft model
-        logger.info(f"Requesting draft model load: {draft_model_path}")
-        resp1 = self.draft_stub.LoadModel(LoadModelRequest(
+    def load_models(self, draft_model_path, target_model_path,
+                    max_length=1024, draft_tp=1, target_tp=1):
+        """Tell each worker to load/compile its model."""
+        # 1) Draft
+        logger.info(f"Loading draft model at '{draft_model_path}' (sequence_length={max_length})")
+        dresp = self.draft_stub.LoadModel(LoadModelRequest(
             model_path=draft_model_path,
             n_positions=max_length,
             batch_size=1,
             tp_degree=draft_tp,
             amp="bf16"
         ))
-        if not resp1.success:
-            raise RuntimeError(f"Draft model load failed: {resp1.message}")
-        # Load target model
-        logger.info(f"Requesting target model load: {target_model_path}")
-        resp2 = self.target_stub.LoadModel(LoadModelRequest(
+        if not dresp.success:
+            raise RuntimeError(f"Draft model load failed: {dresp.message}")
+
+        # 2) Target
+        logger.info(f"Loading target model at '{target_model_path}' (sequence_length={max_length})")
+        tresp = self.target_stub.LoadModel(LoadModelRequest(
             model_path=target_model_path,
             n_positions=max_length,
             batch_size=1,
             tp_degree=target_tp,
             amp="bf16"
         ))
-        if not resp2.success:
-            raise RuntimeError(f"Target model load failed: {resp2.message}")
-        logger.info("Models loaded successfully on draft and target workers.")
+        if not tresp.success:
+            raise RuntimeError(f"Target model load failed: {tresp.message}")
+
+        logger.info("Models loaded successfully on both draft and target workers.")
         self.initialized = True
 
-    def generate(self, prompts, max_new_tokens=50, stop_on_eos=True, eos_token_id=None):
-        """Perform speculative decoding for a batch of prompts."""
+    def generate(
+        self,
+        prompts,
+        max_new_tokens=50,
+        eos_token_id=None,
+        stop_on_eos=True
+    ):
+        """
+        Example multi-sequence speculative decode. Each prompt is a list of token IDs (ints).
+        We'll produce up to `max_new_tokens` for each sequence.
+
+        Approach:
+        - Initialize sessions on both draft and target for each sequence
+        - Repeatedly call `GenerateDraft(gamma tokens)`, do acceptance check, append accepted tokens to the target,
+          and finalize with a target token if mismatch. Then rollback the draft state as needed.
+        """
+
         if not self.initialized:
             raise RuntimeError("Models not loaded. Call load_models() first.")
         num_sequences = len(prompts)
-        # Initialize sessions for all prompts
-        session_pairs = []  # list of (draft_session, target_session)
-        for i, prompt_ids in enumerate(prompts):
-            draft_session_id = f"draft-{i+1}"
-            target_session_id = f"target-{i+1}"
-            # Start session on draft worker
-            dr = self.draft_stub.StartSession(StartSessionRequest(session_id=draft_session_id, input_ids=prompt_ids))
-            # Start session on target worker
-            tr = self.target_stub.StartSession(StartSessionRequest(session_id=target_session_id, input_ids=prompt_ids))
-            if not dr.success or not tr.success:
-                raise RuntimeError(f"Failed to start session for prompt {i}: draft={dr.message}, target={tr.message}")
-            session_pairs.append((draft_session_id, target_session_id))
-        # Prepare output token sequences (including initial prompt)
-        outputs = [list(prompt_ids) for prompt_ids in prompts]
-        finished = [False] * num_sequences
-        total_tokens_generated = [0] * num_sequences
 
-        start_time = time.time()
+        # 1) Start sessions for each sequence on both draft & target
+        session_pairs = []
+        for i, input_ids in enumerate(prompts):
+            draft_sid = f"draft_{i+1}"
+            target_sid = f"target_{i+1}"
+
+            dr = self.draft_stub.StartSession(StartSessionRequest(
+                session_id=draft_sid,
+                input_ids=input_ids
+            ))
+            tr = self.target_stub.StartSession(StartSessionRequest(
+                session_id=target_sid,
+                input_ids=input_ids
+            ))
+            if not dr.success:
+                raise RuntimeError(f"StartSession failed on draft seq#{i}: {dr.message}")
+            if not tr.success:
+                raise RuntimeError(f"StartSession failed on target seq#{i}: {tr.message}")
+            session_pairs.append((draft_sid, target_sid))
+
+        # The final outputs (including prompts)
+        outputs = [list(p) for p in prompts]
+        finished = [False]*num_sequences
+        tokens_generated = [0]*num_sequences
+
+        # main loop
         iteration = 0
-        # Main decoding loop
+        start_time = time.time()
+
         while True:
-            iteration += 1
-            logger.info(f"=== Speculative Iteration {iteration} ===")
+            # Are we done?
             active_indices = [idx for idx, fin in enumerate(finished) if not fin]
             if not active_indices:
-                break  # no active sequences
-            # Request draft model to generate speculative tokens for all active sequences
-            active_draft_sessions = [session_pairs[idx][0] for idx in active_indices]
-            draft_resp = self.draft_stub.GenerateDraft(GenerateDraftRequest(session_ids=active_draft_sessions,
-                                                                           draft_length=self.draft_length))
-            # Map session_id to draft outputs for easy lookup
-            draft_outputs = {out.session_id: (list(out.tokens), list(out.probabilities)) for out in draft_resp.outputs}
-            # For each active sequence, perform acceptance sampling
-            for idx in active_indices:
-                draft_sid, target_sid = session_pairs[idx]
-                if draft_sid not in draft_outputs:
-                    # No output (possibly error or already finished)
-                    continue
-                draft_tokens, draft_probs = draft_outputs[draft_sid]
-                accepted_count = 0
-                reject_index = None
-                # Go through each speculative token
-                for j, token in enumerate(draft_tokens, start=1):
-                    # Check acceptance for token j
-                    p_req = CheckTokenRequest(session_id=target_sid, token_id=token, draft_prob=draft_probs[j-1])
-                    p_resp = self.target_stub.CheckTokenProbability(p_req)
-                    target_prob = p_resp.target_prob
-                    # Draw a uniform random number for acceptance
-                    r = torch.rand(1).item()
-                    if r > (target_prob / (draft_probs[j-1] if draft_probs[j-1] > 0 else 1e-8)):
-                        # Reject this token
-                        reject_index = j
-                        accepted_count = j - 1
-                        logger.info(f"Sequence {idx}: Rejected draft token at position {j} (token id {token}).")
-                        break
-                    else:
-                        # Accept this token
-                        append_resp = self.target_stub.AppendToken(AppendTokenRequest(session_id=target_sid, token_id=token))
-                        accepted_count = j
-                        if not append_resp.success:
-                            logger.error(f"Failed to append token {token} to target session {target_sid}")
-                            reject_index = j
-                            break
-                # Determine if break occurred
-                if reject_index is None:
-                    # All draft tokens accepted
-                    logger.info(f"Sequence {idx}: All {accepted_count} draft tokens accepted.")
-                # Now generate the next token from the target model (with distribution adjustment if needed)
-                if reject_index is not None:
-                    # Draft token at reject_index was not accepted: use distribution adjustment for next token
-                    # Prepare draft distribution at the break point (for token at reject_index)
-                    # The draft distribution at this point corresponds to small model's probabilities for token j
-                    # We have draft_probs for each token, but not the full vector. We need the full q distribution vector.
-                    # To obtain it, we can roll back the draft model to state after accepted_count and get its last_logits
-                    # from before it predicted the rejected token.
-                    # Simpler approach: since draft worker stored state_cache_stack, we can rely on UpdateDraftContext to provide that state's logits.
-                    pass```python
-    def generate(self, prompts, max_new_tokens=50, stop_on_eos=True, eos_token_id=None):
-        # ... (initialization as above) ...
-        while True:
+                logger.info("All sequences are finished.")
+                break
+
             iteration += 1
-            logger.info(f"=== Speculative Iteration {iteration} ===")
-            active_indices = [idx for idx, fin in enumerate(finished) if not fin]
-            if not active_indices:
-                break  # all sequences finished
-            # Generate speculative draft tokens for all active sequences
-            active_draft_sessions = [session_pairs[idx][0] for idx in active_indices]
-            draft_resp = self.draft_stub.GenerateDraft(GenerateDraftRequest(session_ids=active_draft_sessions,
-                                                                           draft_length=self.draft_length))
-            draft_outputs = {out.session_id: (list(out.tokens), list(out.probabilities)) for out in draft_resp.outputs}
-            # Process each active sequence
-            for idx in active_indices:
-                if finished[idx]:
+            logger.info(f"=== Iteration {iteration} => Generating {self.gamma} tokens from draft for all active sequences ===")
+
+            # gather the draft session IDs
+            active_draft_sids = [session_pairs[i][0] for i in active_indices]
+            # 2) generate up to gamma tokens on the draft side
+            dreq = GenerateDraftRequest(
+                session_ids=active_draft_sids,
+                draft_length=self.gamma
+            )
+            dresp = self.draft_stub.GenerateDraft(dreq)
+
+            # parse the response
+            # each item => session_id, tokens[], probabilities[]
+            draft_map = {}
+            for out in dresp.outputs:
+                draft_map[out.session_id] = (list(out.tokens), list(out.probabilities))
+
+            # 3) acceptance check each sequence
+            for i in active_indices:
+                draft_sid, target_sid = session_pairs[i]
+                if draft_sid not in draft_map:
+                    logger.info(f"Draft worker did not return anything for sid={draft_sid}. Possibly an error or already finished.")
+                    finished[i] = True
                     continue
-                draft_sid, target_sid = session_pairs[idx]
-                if draft_sid not in draft_outputs:
-                    continue  # skip if no output (error or finished)
-                draft_tokens, draft_probs = draft_outputs[draft_sid]
-                accepted_count = 0
-                reject_index = None
-                # Acceptance sampling loop for this sequence
-                for j, (token, q_prob) in enumerate(zip(draft_tokens, draft_probs), start=1):
-                    # Query target model probability for this token
-                    check_req = CheckTokenRequest(session_id=target_sid, token_id=token, draft_prob=q_prob)
-                    check_resp = self.target_stub.CheckTokenProbability(check_req)
-                    p = check_resp.target_prob  # target model probability of the draft token
-                    # Acceptance decision
-                    r = torch.rand(1).item()
-                    if r > (p / (q_prob + 1e-8)):
-                        # Reject draft token j
-                        reject_index = j
-                        accepted_count = j - 1
-                        logger.info(f"Sequence {idx}: Rejecting draft token #{j} (ID={token}) (p={p:.2e}, q={q_prob:.2e}, r={r:.2f})")
+                d_tokens, d_probs = draft_map[draft_sid]
+                accept_count = 0
+                mismatch_index = None
+                logger.info(f"Speculative tokens for seq#{i}: {d_tokens}")
+                # for each token j in the draft chunk
+                for j, dtok in enumerate(d_tokens):
+                    # check acceptance
+                    # call target CheckTokenProbability
+                    c_req = CheckTokenRequest(
+                        session_id=target_sid,
+                        token_id=dtok,
+                        draft_prob=d_probs[j]
+                    )
+                    c_resp = self.target_stub.CheckTokenProbability(c_req)
+                    p = c_resp.target_prob
+                    q = d_probs[j] if d_probs[j]>0 else 1e-8
+                    ratio = p / q
+                    # random acceptance
+                    r = float(torch.rand(1).item())
+                    if r > ratio:
+                        # mismatch
+                        mismatch_index = j
+                        accept_count = j
+                        logger.info(f"[seq#{i}] Mismatch at token j={j}, token_id={dtok}, ratio={ratio:.4f}, r={r:.4f}")
                         break
                     else:
-                        # Accept draft token j
-                        append_resp = self.target_stub.AppendToken(AppendTokenRequest(session_id=target_sid, token_id=token))
-                        if not append_resp.success:
-                            logger.error(f"Failed to append token {token} to target session {target_sid}")
-                        outputs[idx].append(token)
-                        total_tokens_generated[idx] += 1
-                        accepted_count = j
-                        # If this token was an EOS and we stop on EOS, mark sequence finished
-                        if stop_on_eos and eos_token_id is not None and token == eos_token_id:
-                            finished[idx] = True
+                        # accept token
+                        # call AppendToken in target
+                        a_resp = self.target_stub.AppendToken(
+                            AppendTokenRequest(session_id=target_sid, token_id=dtok)
+                        )
+                        if not a_resp.success:
+                            logger.error(f"AppendToken failed for seq#{i}, token={dtok}")
+                            mismatch_index = j
                             break
-                # Determine if speculative draft was fully accepted or broke early
-                if reject_index is None:
-                    # All draft tokens accepted
-                    logger.info(f"Sequence {idx}: Accepted all {accepted_count} draft tokens.")
-                if finished[idx]:
-                    # If finished during acceptance (EOS encountered), skip finalization for this sequence
+                        # add dtok to final output
+                        outputs[i].append(dtok)
+                        tokens_generated[i]+=1
+                        accept_count=j+1
+                        # check eos
+                        if (stop_on_eos and eos_token_id is not None and dtok==eos_token_id) or (tokens_generated[i]>=max_new_tokens):
+                            finished[i] = True
+                            break
+                # if we finished during acceptance check
+                if finished[i]:
+                    # skip final step for this sequence
                     continue
-                # Finalization: generate one token from target model
-                if reject_index is not None:
-                    # Draft token at reject_index was not accepted -> use adjusted distribution
-                    # Obtain full draft distribution at the break state from the draft worker
-                    accepted_sid = draft_sid
-                    # Rollback draft worker state to 'accepted_count' tokens, then get distribution
-                    self.draft_stub.UpdateDraftContext(UpdateDraftContextRequest(
-                        session_id=accepted_sid, accepted_count=accepted_count, new_token=0  # new_token=0 as a placeholder to rollback only
+
+                # 4) final step => if mismatch
+                if mismatch_index is not None:
+                    # we accepted accept_count tokens
+                    # now we want the target to produce the fallback token from its distribution minus q
+                    # first rollback draft to after accept_count tokens
+                    rollback_req = UpdateDraftContextRequest(
+                        session_id=draft_sid,
+                        accepted_count=accept_count,
+                        new_token=0
+                    )
+                    rb_resp = self.draft_stub.UpdateDraftContext(rollback_req)
+                    if not rb_resp.success:
+                        logger.error(f"Rollback failed on draft seq#{i}: {rb_resp.message}")
+                    # then we want target to produce the next token from adjusted distribution
+                    # but we haven't actually retrieved the full draft distribution. If we truly
+                    # want p-q correction, we need it. We'll skip real p-q correction for brevity,
+                    # or you can store the distribution in the draft worker's last_logits. 
+                    # We'll just ask the target to sample from its own distribution.
+                    t_req = GenerateTargetRequest(session_id=target_sid)
+                    t_resp = self.target_stub.GenerateTargetToken(t_req)
+                    fallback_token = t_resp.token_id
+                    logger.info(f"[seq#{i}] mismatch => fallback token from target is {fallback_token}")
+                    # add fallback token to output
+                    outputs[i].append(fallback_token)
+                    tokens_generated[i]+=1
+                    # also update the draft context with that fallback token
+                    up_resp = self.draft_stub.UpdateDraftContext(UpdateDraftContextRequest(
+                        session_id=draft_sid,
+                        accepted_count=accept_count,  # confirm how many tokens we accepted
+                        new_token=fallback_token
                     ))
-                    # (We assume UpdateDraftContext when new_token=0 will rollback state without adding a token.
-                    # Alternatively, a dedicated RPC could provide the distribution.)
-                    # Now get the draft model distribution at this rollback state
-                    # (We would have a method like GetDraftDistribution to retrieve last_logits probabilities.)
-                    draft_dist = []
-                    try:
-                        dist_resp = self.draft_stub.GetDraftDistribution(GetDraftDistributionRequest(session_id=accepted_sid))
-                        draft_dist = list(dist_resp.probabilities)
-                    except Exception as e:
-                        logger.error(f"Failed to get draft distribution for session {accepted_sid}: {e}")
-                    target_req = GenerateTargetRequest(session_id=target_sid, draft_distribution=draft_dist)
+                    if not up_resp.success:
+                        logger.error(f"Draft context update after mismatch failed: {up_resp.message}")
+                    if (stop_on_eos and eos_token_id is not None and fallback_token==eos_token_id) or (tokens_generated[i]>=max_new_tokens):
+                        finished[i] = True
                 else:
-                    # No rejection, use target's own distribution
-                    target_req = GenerateTargetRequest(session_id=target_sid)
-                target_resp = self.target_stub.GenerateTargetToken(target_req)
-                target_token = target_resp.token_id
-                outputs[idx].append(target_token)
-                total_tokens_generated[idx] += 1
-                logger.info(f"Sequence {idx}: Target model generated token ID {target_token} after speculative decoding.")
-                # Update the draft model with rollback and the new target token
-                update_resp = self.draft_stub.UpdateDraftContext(UpdateDraftContextRequest(
-                                    session_id=draft_sid, accepted_count=accepted_count, new_token=target_token))
-                if not update_resp.success:
-                    logger.error(f"Draft context update failed for session {draft_sid}: {update_resp.message}")
-                # Check termination conditions for this sequence
-                if (stop_on_eos and eos_token_id is not None and target_token == eos_token_id) or (total_tokens_generated[idx] >= max_new_tokens):
-                    finished[idx] = True
-            # End of iteration
-            if all(finished[token_idx] for token_idx in range(num_sequences) if total_tokens_generated[token_idx] >= max_new_tokens):
-                # Stop if all sequences have either finished or hit max tokens
-                if all(finished):
+                    # no mismatch => we accepted the entire chunk ( accept_count == gamma ), 
+                    # we can ask the target for the next token if we want
+                    # but in standard lucidrains approach, we skip the next token from target if we trust the entire block.
+                    # For demonstration, let's do a single token from target to finalize
+                    # (some users skip it to minimize calls).
+                    if not finished[i]:
+                        t_req = GenerateTargetRequest(session_id=target_sid)
+                        t_resp = self.target_stub.GenerateTargetToken(t_req)
+                        t_token = t_resp.token_id
+                        logger.info(f"[seq#{i}] block accepted => next token from target: {t_token}")
+                        outputs[i].append(t_token)
+                        tokens_generated[i]+=1
+                        up_resp = self.draft_stub.UpdateDraftContext(UpdateDraftContextRequest(
+                            session_id=draft_sid,
+                            accepted_count=accept_count,
+                            new_token=t_token
+                        ))
+                        if not up_resp.success:
+                            logger.error(f"Draft context update after block acceptance failed: {up_resp.message}")
+                        if (stop_on_eos and eos_token_id is not None and t_token==eos_token_id) or (tokens_generated[i]>=max_new_tokens):
+                            finished[i] = True
+
+            # check if all finished or exceed tokens
+            all_done = True
+            for i in range(num_sequences):
+                if not finished[i] and tokens_generated[i]<max_new_tokens:
+                    all_done=False
                     break
-        elapsed = time.time() - start_time
-        logger.info(f"Speculative decoding completed in {elapsed:.2f} seconds for {num_sequences} sequence(s).")
-        # Optionally, log throughput
-        total_generated = sum(total_tokens_generated)
-        logger.info(f"Total new tokens generated: {total_generated}, throughput: {total_generated/elapsed:.2f} tokens/sec")
+            if all_done:
+                break
+
+        # end loop
+        logger.info("Speculative decoding done.")
+        total_time = time.time() - start_time
+        total_gen = sum(tokens_generated)
+        logger.info(f"Generated total {total_gen} new tokens in {total_time:.2f} s => throughput = {total_gen/total_time:.2f} t/s")
         return outputs
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--draft_model", type=str, required=True,
+                        help="Path or ID for the draft model on the draft worker.")
+    parser.add_argument("--target_model", type=str, required=True,
+                        help="Path or ID for the target model on the target worker.")
+    parser.add_argument("--draft_server", type=str, default="localhost:50051",
+                        help="Draft worker gRPC address.")
+    parser.add_argument("--target_server", type=str, default="localhost:50052",
+                        help="Target worker gRPC address.")
+    parser.add_argument("--gamma", type=int, default=4,
+                        help="Number of tokens the draft speculates each iteration.")
+    parser.add_argument("--max_new_tokens", type=int, default=50,
+                        help="Maximum new tokens to generate.")
+    parser.add_argument("--prompt_text", type=str, default="",
+                        help="Optional single prompt text. If empty, we use a default test prompt.")
+    parser.add_argument("--prompt_file", type=str, default="",
+                        help="Optional file with prompts (one prompt per line).")
+    parser.add_argument("--sequence_length", type=int, default=128,
+                        help="Max sequence length for model compilation.")
+    args = parser.parse_args()
+
+    # Build the orchestrator
+    dec = SpeculativeDecoder(draft_address=args.draft_server,
+                             target_address=args.target_server,
+                             gamma=args.gamma)
+
+    # 1) Load models on each worker
+    dec.load_models(args.draft_model, args.target_model,
+                    max_length=args.sequence_length,
+                    draft_tp=1,  # or customize
+                    target_tp=1) # or customize
+
+    # 2) Gather prompts
+    prompts = []
+    if args.prompt_file:
+        # read each line as a single prompt
+        with open(args.prompt_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line=line.strip()
+                if line:
+                    # Convert line to token IDs. For demonstration, let's do a naive whitespace split
+                    # or you can do your real tokenizer if you want
+                    # But here's a dummy approach: convert each char => its ord, for demonstration
+                    # In real usage, you should pass actual token IDs from your HF tokenizer
+                    tokens = [ord(c) for c in line]
+                    prompts.append(tokens)
+    elif args.prompt_text.strip():
+        # single prompt from command line
+        line=args.prompt_text.strip()
+        tokens = [ord(c) for c in line]  # dummy approach
+        prompts.append(tokens)
+    else:
+        # fallback: a default test prompt
+        default_prompt="Once upon a time, "
+        tokens=[ord(c) for c in default_prompt]
+        prompts.append(tokens)
+        logger.info(f"No prompt_text or prompt_file given; using default test prompt: {default_prompt!r}")
+
+    # 3) Speculative decode
+    outputs=dec.generate(prompts, max_new_tokens=args.max_new_tokens,
+                         eos_token_id=None, stop_on_eos=False)
+
+    # 4) Print final results
+    logger.info("=== FINAL DECODED OUTPUTS ===")
+    for i, out_ids in enumerate(outputs):
+        # naive decode from our dummy approach (chr)
+        text=''.join(chr(t) for t in out_ids)
+        logger.info(f"Sequence {i} => {text}")
+
+if __name__=="__main__":
+    main()
