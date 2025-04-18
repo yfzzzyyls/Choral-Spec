@@ -1,29 +1,6 @@
 # Distributed Speculative Decoding on AWS Trainium
 
-This repository has been adapted for **multi-device** AWS Trainium usage with **speculative decoding**, using **Meta LLaMA 3.2** (1B draft + 3B target) in **bfloat16**.
-
-## Project Structure
-
-Below is an overview of the repository structure and how the modules relate to each other:
-
-```
-Choral-Spec/
-├── main.py                  # CLI entry point; parses args and launches roles (draft, target, compile, verify)
-├── inference/               # Package for model loading, speculative decoding, and verification logic
-│   ├── model_loader.py      # Utilities to load or compile LLaMA models on AWS Neuron, provides `load_model` and `compile_model`
-│   ├── draft_worker.py      # Draft client process: performs speculative decoding, communicates with target server via gRPC
-│   ├── target_worker.py     # Target server process: serves the target model over gRPC (one token at a time)
-│   ├── speculative.py       # Implements the speculative decoding algorithm (combines draft model predictions with target verification)
-│   └── verify.py            # Verification utilities: can run a model standalone for debugging, and compare draft vs target outputs
-├── grpc_comm/               # gRPC definitions and generated code for inter-process communication
-│   ├── grpc_client.py          # Definition of SpeculativeService (gRPC 
-│   ├── inference.proto          # Definition of SpeculativeService (gRPC service for generation and verification)
-│   ├── inference_pb2.py         # Generated Python classes from the proto definitions
-│   └── inference_pb2_grpc.py    # Generated gRPC client/server code based on the proto
-├── requirements.txt         # Python dependencies for the project
-└── README.md                # Documentation and usage instructions
-
-```
+This repository has been adapted for **multi-device** AWS Trainium usage with **speculative decoding**, using **Meta LLaMA ** (3.2 1B draft + 3.1 8B target) in **bfloat16**.
 
 ## Dpendencies
 
@@ -80,11 +57,15 @@ pip install --upgrade transformers-neuronx
 
 ## **Usage:**
 
-export compiler flag
+Compile the model
 
 ```
-export NEURON_CC_FLAGS="--model-type transformer"
-export NEURON_RT_NUM_CORES=2
+python compile_models.py --model-path /home/ubuntu/models/llama-3.1-8b/ --draft-model-path /home/ubuntu/models/llama-3.2-1b/ --output-compiled-dir ./compiled_llama3.1-8b --tp-size 2 --context-length 128 --speculation-length 4
+```
+
+Set Artifact path
+```
+export NEURON_COMPILED_ARTIFACTS=./compiled_llama3.1-8b
 ```
 
 ### **Optional:**
