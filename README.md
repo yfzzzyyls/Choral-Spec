@@ -65,7 +65,17 @@ python compile_models.py --model-path /home/ubuntu/models/llama-3.1-8b/ --draft-
 
 Set Artifact path
 ```
-export NEURON_COMPILED_ARTIFACTS=./compiled_llama3.1-8b
+export NEURON_COMPILED_ARTIFACTS=$PWD/compiled_llama3.1-8b
+```
+
+Activate the Neuron backend inside vLLM
+```
+export VLLM_NEURON_FRAMEWORK="neuronx-distributed-inference"
+```
+
+Tell the runtime how many Neuron‑cores to use
+```
+export NEURON_RT_NUM_CORES=8
 ```
 
 ### **Optional:**

@@ -8,6 +8,19 @@ import sys
 import argparse
 import subprocess
 
+# Ensure vLLM is available before we proceed
+try:
+    import vllm  # noqa: F401
+except ModuleNotFoundError:
+    sys.stderr.write(
+        "Error: vLLM is not installed in this environment.\n"
+        "Install a Neuron‑compatible build, e.g.:\n"
+        "  pip install --no-deps vllm==0.4.2\n"
+        "or use the pre‑built wheel on the DLAMI:\n"
+        "  pip install /opt/aws_neuronx_wheels/vllm-0.4.2*whl\n"
+    )
+    sys.exit(1)
+
 
 def main():
     p = argparse.ArgumentParser(
