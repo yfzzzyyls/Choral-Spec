@@ -19,7 +19,30 @@ Install dependencies
 ```
 pip install grpcio==1.71.0 grpcio-tools==1.66.2
 pip install gevent
-pip install --upgrade transformers-neuronx
+```
+
+Install vLLM
+NxD Inference supports running models with vLLM. This functionality is available in a fork of the vLLM GitHub repository:
+
+aws-neuron/upstreaming-to-vllm
+To run NxD Inference with vLLM, you need to download and install vLLM from this fork. Clone the Neuron vLLM fork.
+```
+git clone -b neuron-2.22-vllm-v0.7.2 https://github.com/aws-neuron/upstreaming-to-vllm.git
+```
+
+Install the Neuron vLLM fork into the virtual environment
+```
+cd upstreaming-to-vllm
+pip install -r requirements-neuron.txt
+VLLM_TARGET_DEVICE="neuron" pip install -e .
+cd ..
+```
+
+We will use llmperf to measure the performance. We will use the load test feature of LLMPerf and measure the performance for accepting 10,000 tokens as input and generating 1500 tokens as output. Install llmperf into the virtual environment.
+```
+git clone https://github.com/ray-project/llmperf.git
+cd llmperf
+pip install -e .
 ```
 
 Fix transformer version:
