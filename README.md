@@ -22,6 +22,27 @@ pip install gevent
 pip install --upgrade transformers-neuronx
 ```
 
+Fix transformer version:
+```
+pip uninstall -y transformers
+pip install --no-deps transformers==4.45.1
+```
+
+Check transformer version:
+```
+python - <<'PY'
+import transformers, inspect
+print("Transformers version:", transformers.__version__)
+print("has shard_checkpoint:", "shard_checkpoint" in dir(transformers.modeling_utils))
+PY
+```
+
+Fix tokenizer version:
+```
+pip uninstall -y tokenizers
+pip install --no-deps "tokenizers==0.20.3" 
+```
+
 ## Setup
 
 1. **Clone Repo & Install**:
@@ -84,6 +105,11 @@ Clean cache before compile:
 
 ```
 rm -r /var/tmp/neuron-compile-cache
+```
+
+Check neuron toolkit
+```
+pip list | grep neuron
 ```
 
 ### **Compile & Run the Target Model Server**
