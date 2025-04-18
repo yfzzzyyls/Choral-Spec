@@ -2,7 +2,7 @@
 MODEL_PATH="/home/ubuntu/models/llama-3.1-8b/"
 # This is where the compiled model will be saved. The same path
 # should be used when launching vLLM server for inference.
-COMPILED_MODEL_PATH="/home/ubuntu/Choral-Spec/llama-3.1-8b-compiled"
+COMPILED_MODEL_PATH="/home/ubuntu/Choral-Spec/llama-3.1-8b-compiled/"
 
 NUM_CORES=2
 TP_DEGREE=2

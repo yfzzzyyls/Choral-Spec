@@ -66,6 +66,17 @@ pip uninstall -y tokenizers
 pip install --no-deps "tokenizers==0.20.3" 
 ```
 
+Fix run time error:
+comment out lora related import
+```
+vi /opt/aws_neuronx_venv_pytorch_2_5_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/config.py
+#from neuronx_distributed_inference.modules.lora_serving import LoraServingConfig
+```
+```
+vi /home/ubuntu/Choral-Spec/upstreaming-to-vllm/vllm/worker/neuronx_distributed_model_runner.py
+#from neuronx_distributed_inference.modules.lora_serving import (LoraCheckpoint, LoraServingConfig)
+```
+
 ## Setup
 
 1. **Clone Repo & Install**:
